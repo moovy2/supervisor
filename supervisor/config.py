@@ -1,9 +1,8 @@
 """Bootstrap Supervisor."""
-from datetime import datetime
+from datetime import UTC, datetime
 import logging
 import os
 from pathlib import Path, PurePath
-from typing import Optional
 
 from awesomeversion import AwesomeVersion
 
@@ -46,8 +45,12 @@ APPARMOR_CACHE = PurePath("apparmor/cache")
 DNS_DATA = PurePath("dns")
 AUDIO_DATA = PurePath("audio")
 MEDIA_DATA = PurePath("media")
+MOUNTS_FOLDER = PurePath("mounts")
+MOUNTS_CREDENTIALS = PurePath(".mounts_credentials")
+EMERGENCY_DATA = PurePath("emergency")
+ADDON_CONFIGS = PurePath("addon_configs")
 
-DEFAULT_BOOT_TIME = datetime.utcfromtimestamp(0).isoformat()
+DEFAULT_BOOT_TIME = datetime.fromtimestamp(0, UTC).isoformat()
 
 # We filter out UTC because it's the system default fallback
 # Core also not respect the cotnainer timezone and reset timezones
@@ -63,7 +66,7 @@ class CoreConfig(FileConfiguration):
         super().__init__(FILE_HASSIO_CONFIG, SCHEMA_SUPERVISOR_CONFIG)
 
     @property
-    def timezone(self) -> Optional[str]:
+    def timezone(self) -> str | None:
         """Return system timezone."""
         timezone = self._data.get(ATTR_TIMEZONE)
         if timezone != _UTC:
@@ -89,7 +92,7 @@ class CoreConfig(FileConfiguration):
         self._data[ATTR_VERSION] = value
 
     @property
-    def image(self) -> Optional[str]:
+    def image(self) -> str | None:
         """Return supervisor image."""
         return self._data.get(ATTR_IMAGE)
 
@@ -129,7 +132,7 @@ class CoreConfig(FileConfiguration):
         self._data[ATTR_DEBUG_BLOCK] = value
 
     @property
-    def diagnostics(self) -> Optional[bool]:
+    def diagnostics(self) -> bool | None:
         """Return bool if diagnostics is set otherwise None."""
         return self._data[ATTR_DIAGNOSTICS]
 
@@ -151,7 +154,7 @@ class CoreConfig(FileConfiguration):
 
     def modify_log_level(self) -> None:
         """Change log level."""
-        lvl = getattr(logging, str(self.logging.value).upper())
+        lvl = getattr(logging, self.logging.value.upper())
         logging.getLogger("supervisor").setLevel(lvl)
 
     @property
@@ -161,7 +164,7 @@ class CoreConfig(FileConfiguration):
 
         boot_time = parse_datetime(boot_str)
         if not boot_time:
-            return datetime.utcfromtimestamp(1)
+            return datetime.fromtimestamp(1, UTC)
         return boot_time
 
     @last_boot.setter
@@ -180,39 +183,39 @@ class CoreConfig(FileConfiguration):
         return PurePath(os.environ[ENV_SUPERVISOR_SHARE])
 
     @property
-    def path_extern_homeassistant(self) -> str:
+    def path_extern_homeassistant(self) -> PurePath:
         """Return config path external for Docker."""
-        return str(PurePath(self.path_extern_supervisor, HOMEASSISTANT_CONFIG))
+        return PurePath(self.path_extern_supervisor, HOMEASSISTANT_CONFIG)
 
     @property
     def path_homeassistant(self) -> Path:
         """Return config path inside supervisor."""
-        return Path(SUPERVISOR_DATA, HOMEASSISTANT_CONFIG)
+        return self.path_supervisor / HOMEASSISTANT_CONFIG
 
     @property
-    def path_extern_ssl(self) -> str:
+    def path_extern_ssl(self) -> PurePath:
         """Return SSL path external for Docker."""
-        return str(PurePath(self.path_extern_supervisor, HASSIO_SSL))
+        return PurePath(self.path_extern_supervisor, HASSIO_SSL)
 
     @property
     def path_ssl(self) -> Path:
         """Return SSL path inside supervisor."""
-        return Path(SUPERVISOR_DATA, HASSIO_SSL)
+        return self.path_supervisor / HASSIO_SSL
 
     @property
     def path_addons_core(self) -> Path:
         """Return git path for core Add-ons."""
-        return Path(SUPERVISOR_DATA, ADDONS_CORE)
+        return self.path_supervisor / ADDONS_CORE
 
     @property
     def path_addons_git(self) -> Path:
         """Return path for Git Add-on."""
-        return Path(SUPERVISOR_DATA, ADDONS_GIT)
+        return self.path_supervisor / ADDONS_GIT
 
     @property
     def path_addons_local(self) -> Path:
         """Return path for custom Add-ons."""
-        return Path(SUPERVISOR_DATA, ADDONS_LOCAL)
+        return self.path_supervisor / ADDONS_LOCAL
 
     @property
     def path_extern_addons_local(self) -> PurePath:
@@ -222,7 +225,7 @@ class CoreConfig(FileConfiguration):
     @property
     def path_addons_data(self) -> Path:
         """Return root Add-on data folder."""
-        return Path(SUPERVISOR_DATA, ADDONS_DATA)
+        return self.path_supervisor / ADDONS_DATA
 
     @property
     def path_extern_addons_data(self) -> PurePath:
@@ -230,9 +233,19 @@ class CoreConfig(FileConfiguration):
         return PurePath(self.path_extern_supervisor, ADDONS_DATA)
 
     @property
+    def path_addon_configs(self) -> Path:
+        """Return root Add-on configs folder."""
+        return self.path_supervisor / ADDON_CONFIGS
+
+    @property
+    def path_extern_addon_configs(self) -> PurePath:
+        """Return root Add-on configs folder external for Docker."""
+        return PurePath(self.path_extern_supervisor, ADDON_CONFIGS)
+
+    @property
     def path_audio(self) -> Path:
         """Return root audio data folder."""
-        return Path(SUPERVISOR_DATA, AUDIO_DATA)
+        return self.path_supervisor / AUDIO_DATA
 
     @property
     def path_extern_audio(self) -> PurePath:
@@ -242,7 +255,7 @@ class CoreConfig(FileConfiguration):
     @property
     def path_tmp(self) -> Path:
         """Return Supervisor temp folder."""
-        return Path(SUPERVISOR_DATA, TMP_DATA)
+        return self.path_supervisor / TMP_DATA
 
     @property
     def path_extern_tmp(self) -> PurePath:
@@ -252,7 +265,7 @@ class CoreConfig(FileConfiguration):
     @property
     def path_backup(self) -> Path:
         """Return root backup data folder."""
-        return Path(SUPERVISOR_DATA, BACKUP_DATA)
+        return self.path_supervisor / BACKUP_DATA
 
     @property
     def path_extern_backup(self) -> PurePath:
@@ -262,17 +275,17 @@ class CoreConfig(FileConfiguration):
     @property
     def path_share(self) -> Path:
         """Return root share data folder."""
-        return Path(SUPERVISOR_DATA, SHARE_DATA)
+        return self.path_supervisor / SHARE_DATA
 
     @property
     def path_apparmor(self) -> Path:
         """Return root Apparmor profile folder."""
-        return Path(SUPERVISOR_DATA, APPARMOR_DATA)
+        return self.path_supervisor / APPARMOR_DATA
 
     @property
     def path_apparmor_cache(self) -> Path:
         """Return root Apparmor cache folder."""
-        return Path(SUPERVISOR_DATA, APPARMOR_CACHE)
+        return self.path_supervisor / APPARMOR_CACHE
 
     @property
     def path_extern_apparmor(self) -> Path:
@@ -290,19 +303,49 @@ class CoreConfig(FileConfiguration):
         return PurePath(self.path_extern_supervisor, SHARE_DATA)
 
     @property
-    def path_extern_dns(self) -> str:
+    def path_extern_dns(self) -> PurePath:
         """Return dns path external for Docker."""
-        return str(PurePath(self.path_extern_supervisor, DNS_DATA))
+        return PurePath(self.path_extern_supervisor, DNS_DATA)
 
     @property
     def path_dns(self) -> Path:
         """Return dns path inside supervisor."""
-        return Path(SUPERVISOR_DATA, DNS_DATA)
+        return self.path_supervisor / DNS_DATA
 
     @property
     def path_media(self) -> Path:
         """Return root media data folder."""
-        return Path(SUPERVISOR_DATA, MEDIA_DATA)
+        return self.path_supervisor / MEDIA_DATA
+
+    @property
+    def path_mounts(self) -> Path:
+        """Return root mounts folder."""
+        return self.path_supervisor / MOUNTS_FOLDER
+
+    @property
+    def path_extern_mounts(self) -> PurePath:
+        """Return mounts path external for Docker."""
+        return self.path_extern_supervisor / MOUNTS_FOLDER
+
+    @property
+    def path_mounts_credentials(self) -> Path:
+        """Return mounts credentials folder."""
+        return self.path_supervisor / MOUNTS_CREDENTIALS
+
+    @property
+    def path_extern_mounts_credentials(self) -> PurePath:
+        """Return mounts credentials path external for Docker."""
+        return self.path_extern_supervisor / MOUNTS_CREDENTIALS
+
+    @property
+    def path_emergency(self) -> Path:
+        """Return emergency data folder."""
+        return self.path_supervisor / EMERGENCY_DATA
+
+    @property
+    def path_extern_emergency(self) -> PurePath:
+        """Return emergency path external for Docker."""
+        return self.path_extern_supervisor / EMERGENCY_DATA
 
     @property
     def path_extern_media(self) -> PurePath:
@@ -327,3 +370,11 @@ class CoreConfig(FileConfiguration):
             return
 
         self._data[ATTR_ADDONS_CUSTOM_LIST].remove(repo)
+
+    def local_to_extern_path(self, path: PurePath) -> PurePath:
+        """Translate a path relative to supervisor data in the container to its extern path."""
+        return self.path_extern_supervisor / path.relative_to(self.path_supervisor)
+
+    def extern_to_local_path(self, path: PurePath) -> Path:
+        """Translate a path relative to extern supervisor data to its path in the container."""
+        return self.path_supervisor / path.relative_to(self.path_extern_supervisor)

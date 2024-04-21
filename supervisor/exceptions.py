@@ -1,7 +1,5 @@
 """Core Exceptions."""
-
-
-from typing import Callable, Optional
+from collections.abc import Callable
 
 
 class HassioError(Exception):
@@ -9,8 +7,8 @@ class HassioError(Exception):
 
     def __init__(
         self,
-        message: Optional[str] = None,
-        logger: Optional[Callable[..., None]] = None,
+        message: str | None = None,
+        logger: Callable[..., None] | None = None,
     ) -> None:
         """Raise & log."""
         if logger is not None and message is not None:
@@ -38,6 +36,22 @@ class JobConditionException(JobException):
     """Exception happening for job conditions."""
 
 
+class JobStartException(JobException):
+    """Exception occurred starting a job on in current asyncio task."""
+
+
+class JobNotFound(JobException):
+    """Exception for job not found."""
+
+
+class JobInvalidUpdate(JobException):
+    """Exception for invalid update to a job."""
+
+
+class JobGroupExecutionLimitExceeded(JobException):
+    """Exception when job group execution limit exceeded."""
+
+
 # HomeAssistant
 
 
@@ -51,6 +65,10 @@ class HomeAssistantUpdateError(HomeAssistantError):
 
 class HomeAssistantCrashError(HomeAssistantError):
     """Error on crash of a Home Assistant startup."""
+
+
+class HomeAssistantStartupTimeout(HomeAssistantCrashError):
+    """Timeout waiting for Home Assistant successful startup."""
 
 
 class HomeAssistantAPIError(HomeAssistantError):
@@ -115,10 +133,29 @@ class HassOSDataDiskError(HassOSError):
     """Issues with the DataDisk feature from HAOS."""
 
 
+class HassOSSlotNotFound(HassOSError):
+    """Could not find boot slot."""
+
+
+class HassOSSlotUpdateError(HassOSError):
+    """Error while updating a slot via rauc."""
+
+
+# All Plugins
+
+
+class PluginError(HassioError):
+    """Plugin error."""
+
+
+class PluginJobError(PluginError, JobException):
+    """Raise on job error with plugin."""
+
+
 # HaCli
 
 
-class CliError(HassioError):
+class CliError(PluginError):
     """HA cli exception."""
 
 
@@ -126,10 +163,14 @@ class CliUpdateError(CliError):
     """Error on update of a HA cli."""
 
 
+class CliJobError(CliError, PluginJobError):
+    """Raise on job error with cli plugin."""
+
+
 # Observer
 
 
-class ObserverError(HassioError):
+class ObserverError(PluginError):
     """General Observer exception."""
 
 
@@ -137,10 +178,14 @@ class ObserverUpdateError(ObserverError):
     """Error on update of a Observer."""
 
 
+class ObserverJobError(ObserverError, PluginJobError):
+    """Raise on job error with observer plugin."""
+
+
 # Multicast
 
 
-class MulticastError(HassioError):
+class MulticastError(PluginError):
     """Multicast exception."""
 
 
@@ -148,10 +193,14 @@ class MulticastUpdateError(MulticastError):
     """Error on update of a multicast."""
 
 
+class MulticastJobError(MulticastError, PluginJobError):
+    """Raise on job error with multicast plugin."""
+
+
 # DNS
 
 
-class CoreDNSError(HassioError):
+class CoreDNSError(PluginError):
     """CoreDNS exception."""
 
 
@@ -159,15 +208,23 @@ class CoreDNSUpdateError(CoreDNSError):
     """Error on update of a CoreDNS."""
 
 
-# DNS
+class CoreDNSJobError(CoreDNSError, PluginJobError):
+    """Raise on job error with dns plugin."""
 
 
-class AudioError(HassioError):
+# Audio
+
+
+class AudioError(PluginError):
     """PulseAudio exception."""
 
 
 class AudioUpdateError(AudioError):
     """Error on update of a Audio."""
+
+
+class AudioJobError(AudioError, PluginJobError):
+    """Raise on job error with audio plugin."""
 
 
 # Addons
@@ -218,6 +275,10 @@ class AuthPasswordResetError(HassioError):
     """Auth error if password reset failed."""
 
 
+class AuthListUsersError(HassioError):
+    """Auth error if listing users failed."""
+
+
 # Host
 
 
@@ -245,15 +306,37 @@ class HostNetworkNotFound(HostError):
     """Return if host interface is not found."""
 
 
+class HostLogError(HostError):
+    """Internal error with host log."""
+
+
 # API
 
 
 class APIError(HassioError, RuntimeError):
     """API errors."""
 
+    status = 400
+
+    def __init__(
+        self,
+        message: str | None = None,
+        logger: Callable[..., None] | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        """Raise & log, optionally with job."""
+        super().__init__(message, logger)
+        self.job_id = job_id
+
 
 class APIForbidden(APIError):
     """API forbidden error."""
+
+    status = 403
+
+
+class APIAddonNotInstalled(APIError):
+    """Not installed addon requested at addons API."""
 
 
 # Service / Discovery
@@ -278,20 +361,64 @@ class DBusNotConnectedError(HostNotSupportedError):
     """D-Bus is not connected and call a method."""
 
 
+class DBusServiceUnkownError(HassioNotSupportedError):
+    """D-Bus service was not available."""
+
+
 class DBusInterfaceError(HassioNotSupportedError):
     """D-Bus interface not connected."""
 
 
-class DBusFatalError(DBusError):
-    """D-Bus call going wrong."""
+class DBusObjectError(HassioNotSupportedError):
+    """D-Bus object not defined."""
 
 
 class DBusInterfaceMethodError(DBusInterfaceError):
-    """D-Bus method was not defined."""
+    """D-Bus method not defined or input does not match signature."""
+
+
+class DBusInterfacePropertyError(DBusInterfaceError):
+    """D-Bus property not defined or is read-only."""
+
+
+class DBusInterfaceSignalError(DBusInterfaceError):
+    """D-Bus signal not defined."""
 
 
 class DBusParseError(DBusError):
     """D-Bus parse error."""
+
+
+class DBusTimeoutError(DBusError):
+    """D-Bus call timed out."""
+
+
+class DBusNoReplyError(DBusError):
+    """D-Bus remote didn't reply/disconnected."""
+
+
+class DBusFatalError(DBusError):
+    """D-Bus call going wrong.
+
+    Type field contains specific error from D-Bus for interface specific errors (like Systemd ones).
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        logger: Callable[..., None] | None = None,
+        type_: str | None = None,
+    ) -> None:
+        """Initialize object."""
+        super().__init__(message, logger)
+        self.type = type_
+
+
+# dbus/systemd
+
+
+class DBusSystemdNoSuchUnit(DBusError):
+    """Systemd unit does not exist."""
 
 
 # util/apparmor
@@ -307,6 +434,13 @@ class AppArmorFileError(AppArmorError):
 
 class AppArmorInvalidError(AppArmorError):
     """AppArmor profile validate error."""
+
+
+# util/boards
+
+
+class BoardInvalidError(DBusObjectError):
+    """System does not use the board specified."""
 
 
 # util/common
@@ -375,6 +509,17 @@ class WhoamiConnectivityError(WhoamiError):
     """Connectivity errors while using whoami."""
 
 
+# utils/systemd_journal
+
+
+class SystemdJournalError(HassioError):
+    """Error while processing systemd journal logs."""
+
+
+class MalformedBinaryEntryError(SystemdJournalError):
+    """Raised when binary entry in the journal isn't followed by a newline."""
+
+
 # docker/api
 
 
@@ -396,6 +541,10 @@ class DockerTrustError(DockerError):
 
 class DockerNotFound(DockerError):
     """Docker object don't Exists."""
+
+
+class DockerJobError(DockerError, JobException):
+    """Error executing docker job."""
 
 
 # Hardware
@@ -454,9 +603,81 @@ class StoreGitError(StoreError):
     """Raise if something on git is happening."""
 
 
+class StoreGitCloneError(StoreGitError):
+    """Raise if error occurred while cloning repository."""
+
+
 class StoreNotFound(StoreError):
     """Raise if slug is not known."""
 
 
 class StoreJobError(StoreError, JobException):
     """Raise on job error with git."""
+
+
+class StoreInvalidAddonRepo(StoreError):
+    """Raise on invalid addon repo."""
+
+
+# Backup
+
+
+class BackupError(HassioError):
+    """Raise if an error during backup is happening."""
+
+
+class HomeAssistantBackupError(BackupError, HomeAssistantError):
+    """Raise if an error during Home Assistant Core backup is happening."""
+
+
+class BackupInvalidError(BackupError):
+    """Raise if backup or password provided is invalid."""
+
+
+class BackupMountDownError(BackupError):
+    """Raise if mount specified for backup is down."""
+
+
+class BackupJobError(BackupError, JobException):
+    """Raise on Backup job error."""
+
+
+# Security
+
+
+class SecurityError(HassioError):
+    """Raise if an error during security checks are happening."""
+
+
+class SecurityJobError(SecurityError, JobException):
+    """Raise on Security job error."""
+
+
+# Mount
+
+
+class MountError(HassioError):
+    """Raise on an error related to mounting/unmounting."""
+
+
+class MountActivationError(MountError):
+    """Raise on mount not reaching active state after mount/reload."""
+
+
+class MountInvalidError(MountError):
+    """Raise on invalid mount attempt."""
+
+
+class MountNotFound(MountError):
+    """Raise on mount not found."""
+
+
+class MountJobError(MountError, JobException):
+    """Raise on Mount job error."""
+
+
+# Network
+
+
+class NetworkInterfaceNotFound(HassioError):
+    """Raise on network interface not found."""

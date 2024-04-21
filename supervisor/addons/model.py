@@ -1,11 +1,16 @@
 """Init file for Supervisor add-ons."""
 from abc import ABC, abstractmethod
+from collections import defaultdict
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from datetime import datetime
+import logging
 from pathlib import Path
-from typing import Any, Awaitable, Optional
+from typing import Any
 
 from awesomeversion import AwesomeVersion, AwesomeVersionException
 
-from supervisor.addons.const import AddonBackupMode
+from supervisor.utils.dt import utc_from_timestamp
 
 from ..const import (
     ATTR_ADVANCED,
@@ -33,6 +38,7 @@ from ..const import (
     ATTR_HOST_IPC,
     ATTR_HOST_NETWORK,
     ATTR_HOST_PID,
+    ATTR_HOST_UTS,
     ATTR_IMAGE,
     ATTR_INGRESS,
     ATTR_INGRESS_STREAM,
@@ -62,11 +68,13 @@ from ..const import (
     ATTR_TIMEOUT,
     ATTR_TMPFS,
     ATTR_TRANSLATIONS,
+    ATTR_TYPE,
     ATTR_UART,
     ATTR_UDEV,
     ATTR_URL,
     ATTR_USB,
     ATTR_VERSION,
+    ATTR_VERSION_TIMESTAMP,
     ATTR_VIDEO,
     ATTR_WATCHDOG,
     ATTR_WEBUI,
@@ -77,22 +85,43 @@ from ..const import (
     AddonStage,
     AddonStartup,
 )
-from ..coresys import CoreSys, CoreSysAttributes
+from ..coresys import CoreSys
 from ..docker.const import Capabilities
-from .const import ATTR_BACKUP
+from ..exceptions import AddonsNotSupportedError
+from ..jobs.const import JOB_GROUP_ADDON
+from ..jobs.job_group import JobGroup
+from ..utils import version_is_new_enough
+from .configuration import FolderMapping
+from .const import (
+    ATTR_BACKUP,
+    ATTR_BREAKING_VERSIONS,
+    ATTR_CODENOTARY,
+    ATTR_PATH,
+    ATTR_READ_ONLY,
+    AddonBackupMode,
+    MappingType,
+)
 from .options import AddonOptions, UiOptions
-from .validate import RE_SERVICE, RE_VOLUME
+from .validate import RE_SERVICE
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 Data = dict[str, Any]
 
 
-class AddonModel(CoreSysAttributes, ABC):
+class AddonModel(JobGroup, ABC):
     """Add-on Data layout."""
 
     def __init__(self, coresys: CoreSys, slug: str):
         """Initialize data holder."""
-        self.coresys: CoreSys = coresys
+        super().__init__(
+            coresys, JOB_GROUP_ADDON.format_map(defaultdict(str, slug=slug)), slug
+        )
         self.slug: str = slug
+        self._path_icon_exists: bool = False
+        self._path_logo_exists: bool = False
+        self._path_changelog_exists: bool = False
+        self._path_documentation_exists: bool = False
 
     @property
     @abstractmethod
@@ -125,7 +154,7 @@ class AddonModel(CoreSysAttributes, ABC):
         return self.data[ATTR_BOOT]
 
     @property
-    def auto_update(self) -> Optional[bool]:
+    def auto_update(self) -> bool | None:
         """Return if auto update is enable."""
         return None
 
@@ -150,22 +179,22 @@ class AddonModel(CoreSysAttributes, ABC):
         return self.data[ATTR_TIMEOUT]
 
     @property
-    def uuid(self) -> Optional[str]:
+    def uuid(self) -> str | None:
         """Return an API token for this add-on."""
         return None
 
     @property
-    def supervisor_token(self) -> Optional[str]:
+    def supervisor_token(self) -> str | None:
         """Return access token for Supervisor API."""
         return None
 
     @property
-    def ingress_token(self) -> Optional[str]:
+    def ingress_token(self) -> str | None:
         """Return access token for Supervisor API."""
         return None
 
     @property
-    def ingress_entry(self) -> Optional[str]:
+    def ingress_entry(self) -> str | None:
         """Return ingress external URL."""
         return None
 
@@ -175,7 +204,7 @@ class AddonModel(CoreSysAttributes, ABC):
         return self.data[ATTR_DESCRIPTON]
 
     @property
-    def long_description(self) -> Optional[str]:
+    def long_description(self) -> str | None:
         """Return README.md as long_description."""
         readme = Path(self.path_location, "README.md")
 
@@ -200,6 +229,11 @@ class AddonModel(CoreSysAttributes, ABC):
     def latest_version(self) -> AwesomeVersion:
         """Return latest version of add-on."""
         return self.data[ATTR_VERSION]
+
+    @property
+    def latest_version_timestamp(self) -> datetime:
+        """Return when latest version was first seen."""
+        return utc_from_timestamp(self.data[ATTR_VERSION_TIMESTAMP])
 
     @property
     def version(self) -> AwesomeVersion:
@@ -245,32 +279,32 @@ class AddonModel(CoreSysAttributes, ABC):
         return self.data.get(ATTR_DISCOVERY, [])
 
     @property
-    def ports_description(self) -> Optional[dict[str, str]]:
+    def ports_description(self) -> dict[str, str] | None:
         """Return descriptions of ports."""
         return self.data.get(ATTR_PORTS_DESCRIPTION)
 
     @property
-    def ports(self) -> Optional[dict[str, Optional[int]]]:
+    def ports(self) -> dict[str, int | None] | None:
         """Return ports of add-on."""
         return self.data.get(ATTR_PORTS)
 
     @property
-    def ingress_url(self) -> Optional[str]:
+    def ingress_url(self) -> str | None:
         """Return URL to ingress url."""
         return None
 
     @property
-    def webui(self) -> Optional[str]:
+    def webui(self) -> str | None:
         """Return URL to webui or None."""
         return self.data.get(ATTR_WEBUI)
 
     @property
-    def watchdog(self) -> Optional[str]:
+    def watchdog(self) -> str | None:
         """Return URL to for watchdog or None."""
         return self.data.get(ATTR_WATCHDOG)
 
     @property
-    def ingress_port(self) -> Optional[int]:
+    def ingress_port(self) -> int | None:
         """Return Ingress port."""
         return None
 
@@ -305,6 +339,11 @@ class AddonModel(CoreSysAttributes, ABC):
         return self.data[ATTR_HOST_IPC]
 
     @property
+    def host_uts(self) -> bool:
+        """Return True if add-on run on host UTS namespace."""
+        return self.data[ATTR_HOST_UTS]
+
+    @property
     def host_dbus(self) -> bool:
         """Return True if add-on run on host D-BUS."""
         return self.data[ATTR_HOST_DBUS]
@@ -315,7 +354,7 @@ class AddonModel(CoreSysAttributes, ABC):
         return [Path(node) for node in self.data.get(ATTR_DEVICES, [])]
 
     @property
-    def environment(self) -> Optional[dict[str, str]]:
+    def environment(self) -> dict[str, str] | None:
         """Return environment of add-on."""
         return self.data.get(ATTR_ENVIRONMENT)
 
@@ -364,12 +403,12 @@ class AddonModel(CoreSysAttributes, ABC):
         return self.data.get(ATTR_BACKUP_EXCLUDE, [])
 
     @property
-    def backup_pre(self) -> Optional[str]:
+    def backup_pre(self) -> str | None:
         """Return pre-backup command."""
         return self.data.get(ATTR_BACKUP_PRE)
 
     @property
-    def backup_post(self) -> Optional[str]:
+    def backup_post(self) -> str | None:
         """Return post-backup command."""
         return self.data.get(ATTR_BACKUP_POST)
 
@@ -394,7 +433,7 @@ class AddonModel(CoreSysAttributes, ABC):
         return self.data[ATTR_INGRESS]
 
     @property
-    def ingress_panel(self) -> Optional[bool]:
+    def ingress_panel(self) -> bool | None:
         """Return True if the add-on access support ingress."""
         return None
 
@@ -444,7 +483,7 @@ class AddonModel(CoreSysAttributes, ABC):
         return self.data[ATTR_DEVICETREE]
 
     @property
-    def with_tmpfs(self) -> Optional[str]:
+    def with_tmpfs(self) -> str | None:
         """Return if tmp is in memory of add-on."""
         return self.data[ATTR_TMPFS]
 
@@ -464,34 +503,34 @@ class AddonModel(CoreSysAttributes, ABC):
         return self.data[ATTR_VIDEO]
 
     @property
-    def homeassistant_version(self) -> Optional[str]:
+    def homeassistant_version(self) -> str | None:
         """Return min Home Assistant version they needed by Add-on."""
         return self.data.get(ATTR_HOMEASSISTANT)
 
     @property
-    def url(self) -> Optional[str]:
+    def url(self) -> str | None:
         """Return URL of add-on."""
         return self.data.get(ATTR_URL)
 
     @property
     def with_icon(self) -> bool:
         """Return True if an icon exists."""
-        return self.path_icon.exists()
+        return self._path_icon_exists
 
     @property
     def with_logo(self) -> bool:
         """Return True if a logo exists."""
-        return self.path_logo.exists()
+        return self._path_logo_exists
 
     @property
     def with_changelog(self) -> bool:
         """Return True if a changelog exists."""
-        return self.path_changelog.exists()
+        return self._path_changelog_exists
 
     @property
     def with_documentation(self) -> bool:
         """Return True if a documentation exists."""
-        return self.path_documentation.exists()
+        return self._path_documentation_exists
 
     @property
     def supported_arch(self) -> list[str]:
@@ -504,7 +543,15 @@ class AddonModel(CoreSysAttributes, ABC):
         return self.data.get(ATTR_MACHINE, [])
 
     @property
-    def image(self) -> Optional[str]:
+    def arch(self) -> str:
+        """Return architecture to use for the addon's image."""
+        if ATTR_IMAGE in self.data:
+            return self.sys_arch.match(self.data[ATTR_ARCH])
+
+        return self.sys_arch.default
+
+    @property
+    def image(self) -> str | None:
         """Generate image name from data."""
         return self._image(self.data)
 
@@ -514,14 +561,13 @@ class AddonModel(CoreSysAttributes, ABC):
         return ATTR_IMAGE not in self.data
 
     @property
-    def map_volumes(self) -> dict[str, str]:
-        """Return a dict of {volume: policy} from add-on."""
+    def map_volumes(self) -> dict[MappingType, FolderMapping]:
+        """Return a dict of {MappingType: FolderMapping} from add-on."""
         volumes = {}
         for volume in self.data[ATTR_MAP]:
-            result = RE_VOLUME.match(volume)
-            if not result:
-                continue
-            volumes[result.group(1)] = result.group(2) or "ro"
+            volumes[MappingType(volume[ATTR_TYPE])] = FolderMapping(
+                volume.get(ATTR_PATH), volume[ATTR_READ_ONLY]
+            )
 
         return volumes
 
@@ -565,7 +611,7 @@ class AddonModel(CoreSysAttributes, ABC):
         return AddonOptions(self.coresys, raw_schema, self.name, self.slug)
 
     @property
-    def schema_ui(self) -> Optional[list[dict[any, any]]]:
+    def schema_ui(self) -> list[dict[any, any]] | None:
         """Create a UI schema for add-on options."""
         raw_schema = self.data[ATTR_SCHEMA]
 
@@ -578,31 +624,82 @@ class AddonModel(CoreSysAttributes, ABC):
         """Return True if the add-on accesses the system journal."""
         return self.data[ATTR_JOURNALD]
 
+    @property
+    def signed(self) -> bool:
+        """Return True if the image is signed."""
+        return ATTR_CODENOTARY in self.data
+
+    @property
+    def codenotary(self) -> str | None:
+        """Return Signer email address for CAS."""
+        return self.data.get(ATTR_CODENOTARY)
+
+    @property
+    def breaking_versions(self) -> list[AwesomeVersion]:
+        """Return breaking versions of addon."""
+        return self.data[ATTR_BREAKING_VERSIONS]
+
+    def refresh_path_cache(self) -> Awaitable[None]:
+        """Refresh cache of existing paths."""
+
+        def check_paths():
+            self._path_icon_exists = self.path_icon.exists()
+            self._path_logo_exists = self.path_logo.exists()
+            self._path_changelog_exists = self.path_changelog.exists()
+            self._path_documentation_exists = self.path_documentation.exists()
+
+        return self.sys_run_in_executor(check_paths)
+
+    def validate_availability(self) -> None:
+        """Validate if addon is available for current system."""
+        return self._validate_availability(self.data, logger=_LOGGER.error)
+
     def __eq__(self, other):
         """Compaired add-on objects."""
         if not isinstance(other, AddonModel):
             return False
         return self.slug == other.slug
 
-    def _available(self, config) -> bool:
-        """Return True if this add-on is available on this platform."""
+    def _validate_availability(
+        self, config, *, logger: Callable[..., None] | None = None
+    ) -> None:
+        """Validate if addon is available for current system."""
         # Architecture
         if not self.sys_arch.is_supported(config[ATTR_ARCH]):
-            return False
+            raise AddonsNotSupportedError(
+                f"Add-on {self.slug} not supported on this platform, supported architectures: {', '.join(config[ATTR_ARCH])}",
+                logger,
+            )
 
         # Machine / Hardware
         machine = config.get(ATTR_MACHINE)
-        if machine and f"!{self.sys_machine}" in machine:
-            return False
-        elif machine and self.sys_machine not in machine:
-            return False
+        if machine and (
+            f"!{self.sys_machine}" in machine or self.sys_machine not in machine
+        ):
+            raise AddonsNotSupportedError(
+                f"Add-on {self.slug} not supported on this machine, supported machine types: {', '.join(machine)}",
+                logger,
+            )
 
         # Home Assistant
-        version: Optional[AwesomeVersion] = config.get(ATTR_HOMEASSISTANT)
+        version: AwesomeVersion | None = config.get(ATTR_HOMEASSISTANT)
+        with suppress(AwesomeVersionException, TypeError):
+            if version and not version_is_new_enough(
+                self.sys_homeassistant.version, version
+            ):
+                raise AddonsNotSupportedError(
+                    f"Add-on {self.slug} not supported on this system, requires Home Assistant version {version} or greater",
+                    logger,
+                )
+
+    def _available(self, config) -> bool:
+        """Return True if this add-on is available on this platform."""
         try:
-            return self.sys_homeassistant.version >= version
-        except (AwesomeVersionException, TypeError):
-            return True
+            self._validate_availability(config)
+        except AddonsNotSupportedError:
+            return False
+
+        return True
 
     def _image(self, config) -> str:
         """Generate image name from data."""
@@ -613,19 +710,3 @@ class AddonModel(CoreSysAttributes, ABC):
 
         # local build
         return f"{config[ATTR_REPOSITORY]}/{self.sys_arch.default}-addon-{config[ATTR_SLUG]}"
-
-    def install(self) -> Awaitable[None]:
-        """Install this add-on."""
-        return self.sys_addons.install(self.slug)
-
-    def uninstall(self) -> Awaitable[None]:
-        """Uninstall this add-on."""
-        return self.sys_addons.uninstall(self.slug)
-
-    def update(self, backup: Optional[bool] = False) -> Awaitable[None]:
-        """Update this add-on."""
-        return self.sys_addons.update(self.slug, backup=backup)
-
-    def rebuild(self) -> Awaitable[None]:
-        """Rebuild this add-on."""
-        return self.sys_addons.rebuild(self.slug)

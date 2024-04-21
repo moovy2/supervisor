@@ -5,6 +5,7 @@ import logging
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HassioError
 from ..resolution.const import ContextType, IssueType, SuggestionType
+from ..utils.sentry import capture_exception
 from .audio import PluginAudio
 from .base import PluginBase
 from .cli import PluginCli
@@ -72,10 +73,13 @@ class PluginManager(CoreSysAttributes):
                     reference=plugin.slug,
                     suggestions=[SuggestionType.EXECUTE_REPAIR],
                 )
-                self.sys_capture_exception(err)
+                capture_exception(err)
+
+        # Exit if supervisor out of date. Plugins can't update until then
+        if self.sys_supervisor.need_update:
+            return
 
         # Check requirements
-        await self.sys_updater.reload()
         for plugin in self.all_plugins:
             # Check if need an update
             if not plugin.need_update:
@@ -102,11 +106,13 @@ class PluginManager(CoreSysAttributes):
                 )
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.warning("Can't update plugin %s: %s", plugin.slug, err)
-                self.sys_capture_exception(err)
+                capture_exception(err)
 
     async def repair(self) -> None:
         """Repair Supervisor plugins."""
-        await asyncio.wait([plugin.repair() for plugin in self.all_plugins])
+        await asyncio.wait(
+            [self.sys_create_task(plugin.repair()) for plugin in self.all_plugins]
+        )
 
     async def shutdown(self) -> None:
         """Shutdown Supervisor plugin."""
@@ -118,4 +124,4 @@ class PluginManager(CoreSysAttributes):
                 await plugin.stop()
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.warning("Can't stop plugin %s: %s", plugin.slug, err)
-                self.sys_capture_exception(err)
+                capture_exception(err)

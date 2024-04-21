@@ -2,22 +2,23 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Coroutine
+from contextvars import Context, copy_context
 from datetime import datetime
+from functools import partial
 import logging
 import os
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Coroutine, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import aiohttp
-import sentry_sdk
 
 from .config import CoreConfig
 from .const import ENV_SUPERVISOR_DEV, SERVER_SOFTWARE
-from .docker import DockerAPI
 from .utils.dt import UTC, get_time_zone
 
 if TYPE_CHECKING:
-    from .addons import AddonManager
+    from .addons.manager import AddonManager
     from .api import RestAPI
     from .arch import CpuArch
     from .auth import Auth
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from .core import Core
     from .dbus.manager import DBusManager
     from .discovery import Discovery
+    from .docker.manager import DockerAPI
     from .hardware.manager import HardwareManager
     from .homeassistant.module import HomeAssistant
     from .host.manager import HostManager
@@ -33,10 +35,11 @@ if TYPE_CHECKING:
     from .jobs import JobManager
     from .misc.scheduler import Scheduler
     from .misc.tasks import Tasks
+    from .mounts.manager import MountManager
     from .os.manager import OSManager
     from .plugins.manager import PluginManager
     from .resolution.module import ResolutionManager
-    from .security import Security
+    from .security.module import Security
     from .services import ServiceManager
     from .store import StoreManager
     from .supervisor import Supervisor
@@ -63,9 +66,9 @@ class CoreSys:
 
         # Global objects
         self._config: CoreConfig = CoreConfig()
-        self._docker: DockerAPI = DockerAPI()
 
         # Internal objects pointers
+        self._docker: DockerAPI | None = None
         self._core: Core | None = None
         self._arch: CpuArch | None = None
         self._auth: Auth | None = None
@@ -90,11 +93,15 @@ class CoreSys:
         self._jobs: JobManager | None = None
         self._security: Security | None = None
         self._bus: Bus | None = None
+        self._mounts: MountManager | None = None
 
         # Set default header for aiohttp
         self._websession._default_headers = MappingProxyType(
             {aiohttp.hdrs.USER_AGENT: SERVER_SOFTWARE}
         )
+
+        # Task factory attributes
+        self._set_task_context: list[Callable[[Context], Context]] = []
 
     @property
     def dev(self) -> bool:
@@ -128,7 +135,16 @@ class CoreSys:
     @property
     def docker(self) -> DockerAPI:
         """Return DockerAPI object."""
+        if self._docker is None:
+            raise RuntimeError("Docker not set!")
         return self._docker
+
+    @docker.setter
+    def docker(self, value: DockerAPI) -> None:
+        """Set docker object."""
+        if self._docker:
+            raise RuntimeError("Docker already set!")
+        self._docker = value
 
     @property
     def scheduler(self) -> Scheduler:
@@ -467,6 +483,20 @@ class CoreSys:
         self._jobs = value
 
     @property
+    def mounts(self) -> MountManager:
+        """Return mount manager object."""
+        if self._mounts is None:
+            raise RuntimeError("mount manager not set!")
+        return self._mounts
+
+    @mounts.setter
+    def mounts(self, value: MountManager) -> None:
+        """Set a mount manager object."""
+        if self._mounts:
+            raise RuntimeError("mount manager already set!")
+        self._mounts = value
+
+    @property
     def machine(self) -> str | None:
         """Return machine type string."""
         return self._machine
@@ -494,19 +524,64 @@ class CoreSys:
         """Return now in local timezone."""
         return datetime.now(get_time_zone(self.timezone) or UTC)
 
+    def add_set_task_context_callback(
+        self, callback: Callable[[Context], Context]
+    ) -> None:
+        """Add callback used to modify context prior to creating a task.
+
+        Only used for tasks created via CoreSys.create_task. Callback can modify the provided
+        context using context.run (ex. `context.run(var.set, "new_value")`). Callback should
+        return the context to be provided to task.
+        """
+        self._set_task_context.append(callback)
+
     def run_in_executor(
-        self, funct: Callable[..., T], *args: Any
+        self, funct: Callable[..., T], *args: tuple[Any], **kwargs: dict[str, Any]
     ) -> Coroutine[Any, Any, T]:
         """Add an job to the executor pool."""
+        if kwargs:
+            funct = partial(funct, **kwargs)
+
         return self.loop.run_in_executor(None, funct, *args)
+
+    def _create_context(self) -> Context:
+        """Create a new context for a task."""
+        context = copy_context()
+        for callback in self._set_task_context:
+            context = callback(context)
+        return context
 
     def create_task(self, coroutine: Coroutine) -> asyncio.Task:
         """Create an async task."""
-        return self.loop.create_task(coroutine)
+        return self.loop.create_task(coroutine, context=self._create_context())
 
-    def capture_exception(self, err: Exception) -> None:
-        """Capture a exception."""
-        sentry_sdk.capture_exception(err)
+    def call_later(
+        self,
+        delay: float,
+        funct: Callable[..., Coroutine[Any, Any, T]],
+        *args: tuple[Any],
+        **kwargs: dict[str, Any],
+    ) -> asyncio.TimerHandle:
+        """Start a task after a delay."""
+        if kwargs:
+            funct = partial(funct, **kwargs)
+
+        return self.loop.call_later(delay, funct, *args, context=self._create_context())
+
+    def call_at(
+        self,
+        when: datetime,
+        funct: Callable[..., Coroutine[Any, Any, T]],
+        *args: tuple[Any],
+        **kwargs: dict[str, Any],
+    ) -> asyncio.TimerHandle:
+        """Start a task at the specified datetime."""
+        if kwargs:
+            funct = partial(funct, **kwargs)
+
+        return self.loop.call_at(
+            when.timestamp(), funct, *args, context=self._create_context()
+        )
 
 
 class CoreSysAttributes:
@@ -669,20 +744,41 @@ class CoreSysAttributes:
         """Return Job manager object."""
         return self.coresys.jobs
 
+    @property
+    def sys_mounts(self) -> MountManager:
+        """Return mount manager object."""
+        return self.coresys.mounts
+
     def now(self) -> datetime:
         """Return now in local timezone."""
         return self.coresys.now()
 
     def sys_run_in_executor(
-        self, funct: Callable[..., T], *args: Any
+        self, funct: Callable[..., T], *args: tuple[Any], **kwargs: dict[str, Any]
     ) -> Coroutine[Any, Any, T]:
-        """Add an job to the executor pool."""
-        return self.coresys.run_in_executor(funct, *args)
+        """Add a job to the executor pool."""
+        return self.coresys.run_in_executor(funct, *args, **kwargs)
 
     def sys_create_task(self, coroutine: Coroutine) -> asyncio.Task:
         """Create an async task."""
         return self.coresys.create_task(coroutine)
 
-    def sys_capture_exception(self, err: Exception) -> None:
-        """Capture a exception."""
-        self.coresys.capture_exception(err)
+    def sys_call_later(
+        self,
+        delay: float,
+        funct: Callable[..., Coroutine[Any, Any, T]],
+        *args: tuple[Any],
+        **kwargs: dict[str, Any],
+    ) -> asyncio.TimerHandle:
+        """Start a task after a delay."""
+        return self.coresys.call_later(delay, funct, *args, **kwargs)
+
+    def sys_call_at(
+        self,
+        when: datetime,
+        funct: Callable[..., Coroutine[Any, Any, T]],
+        *args: tuple[Any],
+        **kwargs: dict[str, Any],
+    ) -> asyncio.TimerHandle:
+        """Start a task at the specified datetime."""
+        return self.coresys.call_at(when, funct, *args, **kwargs)

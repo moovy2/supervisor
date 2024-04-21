@@ -1,7 +1,8 @@
 """Init file for Supervisor DNS RESTful API."""
 import asyncio
+from collections.abc import Awaitable
 import logging
-from typing import Any, Awaitable
+from typing import Any
 
 from aiohttp import web
 import voluptuous as vol
@@ -21,17 +22,22 @@ from ..const import (
     ATTR_UPDATE_AVAILABLE,
     ATTR_VERSION,
     ATTR_VERSION_LATEST,
-    CONTENT_TYPE_BINARY,
 )
 from ..coresys import CoreSysAttributes
 from ..exceptions import APIError
 from ..validate import dns_server_list, version_tag
-from .utils import api_process, api_process_raw, api_validate
+from .const import ATTR_FALLBACK, ATTR_LLMNR, ATTR_MDNS
+from .utils import api_process, api_validate
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 # pylint: disable=no-value-for-parameter
-SCHEMA_OPTIONS = vol.Schema({vol.Optional(ATTR_SERVERS): dns_server_list})
+SCHEMA_OPTIONS = vol.Schema(
+    {
+        vol.Optional(ATTR_SERVERS): dns_server_list,
+        vol.Optional(ATTR_FALLBACK): vol.Boolean(),
+    }
+)
 
 SCHEMA_VERSION = vol.Schema({vol.Optional(ATTR_VERSION): version_tag})
 
@@ -49,15 +55,26 @@ class APICoreDNS(CoreSysAttributes):
             ATTR_HOST: str(self.sys_docker.network.dns),
             ATTR_SERVERS: self.sys_plugins.dns.servers,
             ATTR_LOCALS: self.sys_plugins.dns.locals,
+            ATTR_MDNS: self.sys_plugins.dns.mdns,
+            ATTR_LLMNR: self.sys_plugins.dns.llmnr,
+            ATTR_FALLBACK: self.sys_plugins.dns.fallback,
         }
 
     @api_process
     async def options(self, request: web.Request) -> None:
         """Set DNS options."""
         body = await api_validate(SCHEMA_OPTIONS, request)
+        restart_required = False
 
         if ATTR_SERVERS in body:
             self.sys_plugins.dns.servers = body[ATTR_SERVERS]
+            restart_required = True
+
+        if ATTR_FALLBACK in body:
+            self.sys_plugins.dns.fallback = body[ATTR_FALLBACK]
+            restart_required = True
+
+        if restart_required:
             self.sys_create_task(self.sys_plugins.dns.restart())
 
         self.sys_plugins.dns.save_data()
@@ -87,11 +104,6 @@ class APICoreDNS(CoreSysAttributes):
         if version == self.sys_plugins.dns.version:
             raise APIError(f"Version {version} is already in use")
         await asyncio.shield(self.sys_plugins.dns.update(version))
-
-    @api_process_raw(CONTENT_TYPE_BINARY)
-    def logs(self, request: web.Request) -> Awaitable[bytes]:
-        """Return DNS Docker logs."""
-        return self.sys_plugins.dns.logs()
 
     @api_process
     def restart(self, request: web.Request) -> Awaitable[None]:

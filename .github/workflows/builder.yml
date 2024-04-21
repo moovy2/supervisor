@@ -33,9 +33,13 @@ on:
       - setup.py
 
 env:
+  DEFAULT_PYTHON: "3.12"
   BUILD_NAME: supervisor
   BUILD_TYPE: supervisor
-  WHEELS_TAG: 3.9-alpine3.14
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
 
 jobs:
   init:
@@ -49,7 +53,7 @@ jobs:
       requirements: ${{ steps.requirements.outputs.changed }}
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v2.4.0
+        uses: actions/checkout@v4.1.2
         with:
           fetch-depth: 0
 
@@ -66,39 +70,51 @@ jobs:
       - name: Get changed files
         id: changed_files
         if: steps.version.outputs.publish == 'false'
-        uses: jitterbit/get-changed-files@v1
+        uses: masesgroup/retrieve-changed-files@v3.0.0
 
       - name: Check if requirements files changed
         id: requirements
         run: |
-          if [[ "${{ steps.changed_files.outputs.all }}" =~ (requirements.txt|build.json) ]]; then
-            echo "::set-output name=changed::true"
+          if [[ "${{ steps.changed_files.outputs.all }}" =~ (requirements.txt|build.yaml) ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
   build:
     name: Build ${{ matrix.arch }} supervisor
     needs: init
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
     strategy:
       matrix:
         arch: ${{ fromJson(needs.init.outputs.architectures) }}
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v2.4.0
+        uses: actions/checkout@v4.1.2
         with:
           fetch-depth: 0
 
+      - name: Write env-file
+        if: needs.init.outputs.requirements == 'true'
+        run: |
+          (
+            # Fix out of memory issues with rust
+            echo "CARGO_NET_GIT_FETCH_WITH_CLI=true"
+          ) > .env_file
+
       - name: Build wheels
         if: needs.init.outputs.requirements == 'true'
-        uses: home-assistant/wheels@master
+        uses: home-assistant/wheels@2024.01.0
         with:
-          tag: ${{ env.WHEELS_TAG }}
+          abi: cp312
+          tag: musllinux_1_2
           arch: ${{ matrix.arch }}
-          wheels-host: wheels.hass.io
           wheels-key: ${{ secrets.WHEELS_KEY }}
-          wheels-user: wheels
-          apk: "build-base;libffi-dev;openssl-dev;cargo"
+          apk: "libffi-dev;openssl-dev;yaml-dev"
           skip-binary: aiohttp
+          env-file: true
           requirements: "requirements.txt"
 
       - name: Set version
@@ -107,16 +123,33 @@ jobs:
         with:
           type: ${{ env.BUILD_TYPE }}
 
-      - name: Login to DockerHub
+      - name: Set up Python ${{ env.DEFAULT_PYTHON }}
         if: needs.init.outputs.publish == 'true'
-        uses: docker/login-action@v1.12.0
+        uses: actions/setup-python@v5.1.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          python-version: ${{ env.DEFAULT_PYTHON }}
+
+      - name: Install Cosign
+        if: needs.init.outputs.publish == 'true'
+        uses: sigstore/cosign-installer@v3.5.0
+        with:
+          cosign-release: "v2.2.3"
+
+      - name: Install dirhash and calc hash
+        if: needs.init.outputs.publish == 'true'
+        run: |
+          pip3 install setuptools dirhash
+          dir_hash="$(dirhash "${{ github.workspace }}/supervisor" -a sha256 --match "*.py")"
+          echo "${dir_hash}" > rootfs/supervisor.sha256
+
+      - name: Sign supervisor SHA256
+        if: needs.init.outputs.publish == 'true'
+        run: |
+          cosign sign-blob --yes rootfs/supervisor.sha256 --bundle rootfs/supervisor.sha256.sig
 
       - name: Login to GitHub Container Registry
         if: needs.init.outputs.publish == 'true'
-        uses: docker/login-action@v1.12.0
+        uses: docker/login-action@v3.1.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -127,41 +160,16 @@ jobs:
         run: echo "BUILD_ARGS=--test" >> $GITHUB_ENV
 
       - name: Build supervisor
-        uses: home-assistant/builder@2021.12.0
+        uses: home-assistant/builder@2024.03.5
         with:
           args: |
             $BUILD_ARGS \
             --${{ matrix.arch }} \
             --target /data \
+            --cosign \
             --generic ${{ needs.init.outputs.version }}
         env:
           CAS_API_KEY: ${{ secrets.CAS_TOKEN }}
-
-  codenotary:
-    name: CodeNotary signature
-    needs: init
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout the repository
-        if: needs.init.outputs.publish == 'true'
-        uses: actions/checkout@v2.4.0
-        with:
-          fetch-depth: 0
-
-      - name: Set version
-        if: needs.init.outputs.publish == 'true'
-        uses: home-assistant/actions/helpers/version@master
-        with:
-          type: ${{ env.BUILD_TYPE }}
-
-      - name: Signing image
-        if: needs.init.outputs.publish == 'true'
-        uses: home-assistant/actions/helpers/codenotary@master
-        with:
-          source: dir://${{ github.workspace }}
-          user: ${{ secrets.VCN_USER }}
-          password: ${{ secrets.VCN_PASSWORD }}
-          organisation: ${{ secrets.VCN_ORG }}
 
   version:
     name: Update version
@@ -170,7 +178,7 @@ jobs:
     steps:
       - name: Checkout the repository
         if: needs.init.outputs.publish == 'true'
-        uses: actions/checkout@v2.4.0
+        uses: actions/checkout@v4.1.2
 
       - name: Initialize git
         if: needs.init.outputs.publish == 'true'
@@ -191,15 +199,15 @@ jobs:
   run_supervisor:
     runs-on: ubuntu-latest
     name: Run the Supervisor
-    needs: ["build", "codenotary", "init"]
+    needs: ["build", "init"]
     timeout-minutes: 60
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v2.4.0
+        uses: actions/checkout@v4.1.2
 
       - name: Build the Supervisor
         if: needs.init.outputs.publish != 'true'
-        uses: home-assistant/builder@2021.12.0
+        uses: home-assistant/builder@2024.03.5
         with:
           args: |
             --test \
@@ -211,7 +219,7 @@ jobs:
         if: needs.init.outputs.publish == 'true'
         run: |
           docker pull ghcr.io/home-assistant/amd64-hassio-supervisor:${{ needs.init.outputs.version }}
-          docker tag ghcr.io/home-assistant/amd64-hassio-supervisor:${{ needs.init.outputs.version }} homeassistant/amd64-hassio-supervisor:runner
+          docker tag ghcr.io/home-assistant/amd64-hassio-supervisor:${{ needs.init.outputs.version }} ghcr.io/home-assistant/amd64-hassio-supervisor:runner
 
       - name: Create the Supervisor
         run: |
@@ -228,7 +236,7 @@ jobs:
             -e SUPERVISOR_NAME=hassio_supervisor \
             -e SUPERVISOR_DEV=1 \
             -e SUPERVISOR_MACHINE="qemux86-64" \
-          homeassistant/amd64-hassio-supervisor:runner
+          ghcr.io/home-assistant/amd64-hassio-supervisor:runner
 
       - name: Start the Supervisor
         run: docker start hassio_supervisor
@@ -246,13 +254,13 @@ jobs:
         run: |
           echo "Checking supervisor info"
           test=$(docker exec hassio_cli ha supervisor info --no-progress --raw-json | jq -r '.result')
-          if [ "$test" != "ok" ];then
+          if [ "$test" != "ok" ]; then
             exit 1
           fi
 
           echo "Checking supervisor network info"
           test=$(docker exec hassio_cli ha network info --no-progress --raw-json | jq -r '.result')
-          if [ "$test" != "ok" ];then
+          if [ "$test" != "ok" ]; then
             exit 1
           fi
 
@@ -260,13 +268,25 @@ jobs:
         run: |
           echo "Install Core SSH Add-on"
           test=$(docker exec hassio_cli ha addons install core_ssh --no-progress --raw-json | jq -r '.result')
-          if [ "$test" != "ok" ];then
+          if [ "$test" != "ok" ]; then
+            exit 1
+          fi
+
+          # Make sure it actually installed
+          test=$(docker exec hassio_cli ha addons info core_ssh --no-progress --raw-json | jq -r '.data.version')
+          if [[ "$test" == "null" ]]; then
             exit 1
           fi
 
           echo "Start Core SSH Add-on"
           test=$(docker exec hassio_cli ha addons start core_ssh --no-progress --raw-json | jq -r '.result')
-          if [ "$test" != "ok" ];then
+          if [ "$test" != "ok" ]; then
+            exit 1
+          fi
+
+          # Make sure its state is started
+          test="$(docker exec hassio_cli ha addons info core_ssh --no-progress --raw-json | jq -r '.data.state')"
+          if [ "$test" != "started" ]; then
             exit 1
           fi
 
@@ -275,19 +295,83 @@ jobs:
         run: |
           echo "Enable Content-Trust"
           test=$(docker exec hassio_cli ha security options --content-trust=true --no-progress --raw-json | jq -r '.result')
-          if [ "$test" != "ok" ];then
+          if [ "$test" != "ok" ]; then
             exit 1
           fi
 
           echo "Run supervisor health check"
           test=$(docker exec hassio_cli ha resolution healthcheck --no-progress --raw-json | jq -r '.result')
-          if [ "$test" != "ok" ];then
+          if [ "$test" != "ok" ]; then
             exit 1
           fi
 
           echo "Check supervisor unhealthy"
           test=$(docker exec hassio_cli ha resolution info --no-progress --raw-json | jq -r '.data.unhealthy[]')
-          if [ "$test" != "" ];then
+          if [ "$test" != "" ]; then
+            exit 1
+          fi
+
+          echo "Check supervisor supported"
+          test=$(docker exec hassio_cli ha resolution info --no-progress --raw-json | jq -r '.data.unsupported[]')
+          if [[ "$test" =~ source_mods ]]; then
+            exit 1
+          fi
+
+      - name: Create full backup
+        id: backup
+        run: |
+          test=$(docker exec hassio_cli ha backups new --no-progress --raw-json)
+          if [ "$(echo $test | jq -r '.result')" != "ok" ]; then
+            exit 1
+          fi
+          echo "slug=$(echo $test | jq -r '.data.slug')" >> "$GITHUB_OUTPUT"
+
+      - name: Uninstall SSH add-on
+        run: |
+          test=$(docker exec hassio_cli ha addons uninstall core_ssh --no-progress --raw-json | jq -r '.result')
+          if [ "$test" != "ok" ]; then
+            exit 1
+          fi
+
+      - name: Restart supervisor
+        run: |
+          test=$(docker exec hassio_cli ha supervisor restart --no-progress --raw-json | jq -r '.result')
+          if [ "$test" != "ok" ]; then
+            exit 1
+          fi
+
+      - name: Wait for Supervisor to come up
+        run: |
+          SUPERVISOR=$(docker inspect --format='{{.NetworkSettings.IPAddress}}' hassio_supervisor)
+          ping="error"
+          while [ "$ping" != "ok" ]; do
+            ping=$(curl -sSL "http://$SUPERVISOR/supervisor/ping" | jq -r '.result')
+            sleep 5
+          done
+
+      - name: Restore SSH add-on from backup
+        run: |
+          test=$(docker exec hassio_cli ha backups restore ${{ steps.backup.outputs.slug }} --addons core_ssh --no-progress --raw-json | jq -r '.result')
+          if [ "$test" != "ok" ]; then
+            exit 1
+          fi
+
+          # Make sure it actually installed
+          test=$(docker exec hassio_cli ha addons info core_ssh --no-progress --raw-json | jq -r '.data.version')
+          if [[ "$test" == "null" ]]; then
+            exit 1
+          fi
+
+          # Make sure its state is started
+          test="$(docker exec hassio_cli ha addons info core_ssh --no-progress --raw-json | jq -r '.data.state')"
+          if [ "$test" != "started" ]; then
+            exit 1
+          fi
+
+      - name: Restore SSL directory from backup
+        run: |
+          test=$(docker exec hassio_cli ha backups restore ${{ steps.backup.outputs.slug }} --folders ssl --no-progress --raw-json | jq -r '.result')
+          if [ "$test" != "ok" ]; then
             exit 1
           fi
 

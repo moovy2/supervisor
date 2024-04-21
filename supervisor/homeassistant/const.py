@@ -1,13 +1,19 @@
 """Constants for homeassistant."""
-from enum import Enum
+from datetime import timedelta
+from enum import StrEnum
+from pathlib import PurePath
 
 from awesomeversion import AwesomeVersion
 
 from ..const import CoreState
 
+ATTR_OVERRIDE_IMAGE = "override_image"
 LANDINGPAGE: AwesomeVersion = AwesomeVersion("landingpage")
-
-MIN_VERSION = {"supervisor/event": "2021.2.4"}
+WATCHDOG_RETRY_SECONDS = 10
+WATCHDOG_MAX_ATTEMPTS = 5
+WATCHDOG_THROTTLE_PERIOD = timedelta(minutes=30)
+WATCHDOG_THROTTLE_MAX_CALLS = 10
+SAFE_MODE_FILENAME = PurePath("safe-mode")
 
 CLOSING_STATES = [
     CoreState.SHUTDOWN,
@@ -16,15 +22,22 @@ CLOSING_STATES = [
 ]
 
 
-class WSType(str, Enum):
+class WSType(StrEnum):
     """Websocket types."""
 
     AUTH = "auth"
     SUPERVISOR_EVENT = "supervisor/event"
+    BACKUP_START = "backup/start"
+    BACKUP_END = "backup/end"
 
 
-class WSEvent(str, Enum):
+class WSEvent(StrEnum):
     """Websocket events."""
 
     ADDON = "addon"
+    HEALTH_CHANGED = "health_changed"
+    ISSUE_CHANGED = "issue_changed"
+    ISSUE_REMOVED = "issue_removed"
+    JOB = "job"
     SUPERVISOR_UPDATE = "supervisor_update"
+    SUPPORTED_CHANGED = "supported_changed"

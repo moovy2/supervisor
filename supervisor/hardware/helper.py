@@ -1,9 +1,8 @@
 """Read hardware info from system."""
-from datetime import datetime
+from datetime import UTC, datetime
 import logging
 from pathlib import Path
 import re
-from typing import Optional
 
 import pyudev
 
@@ -42,7 +41,7 @@ class HwHelper(CoreSysAttributes):
         return bool(self.sys_hardware.filter_devices(subsystem=UdevSubsystem.USB))
 
     @property
-    def last_boot(self) -> Optional[str]:
+    def last_boot(self) -> datetime | None:
         """Return last boot time."""
         try:
             stats: str = _PROC_STAT.read_text(encoding="utf-8")
@@ -51,12 +50,12 @@ class HwHelper(CoreSysAttributes):
             return None
 
         # parse stat file
-        found: Optional[re.Match] = _RE_BOOT_TIME.search(stats)
+        found: re.Match | None = _RE_BOOT_TIME.search(stats)
         if not found:
             _LOGGER.error("Can't found last boot time!")
             return None
 
-        return datetime.utcfromtimestamp(int(found.group(1)))
+        return datetime.fromtimestamp(int(found.group(1)), UTC)
 
     def hide_virtual_device(self, udev_device: pyudev.Device) -> bool:
         """Small helper to hide not needed Devices."""

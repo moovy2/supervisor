@@ -1,9 +1,12 @@
 """Supervisor resolution center."""
 import logging
-from typing import Any, Optional
+from typing import Any
+
+import attr
 
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import ResolutionError, ResolutionNotFound
+from ..homeassistant.const import WSEvent
 from ..utils.common import FileConfiguration
 from .check import ResolutionCheck
 from .const import (
@@ -15,7 +18,7 @@ from .const import (
     UnhealthyReason,
     UnsupportedReason,
 )
-from .data import Issue, Suggestion
+from .data import HealthChanged, Issue, Suggestion, SupportedChanged
 from .evaluate import ResolutionEvaluation
 from .fixup import ResolutionFixup
 from .notify import ResolutionNotify
@@ -82,6 +85,11 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         )
         self._issues.append(issue)
 
+        # Event on issue creation
+        self.sys_homeassistant.websocket.supervisor_event(
+            WSEvent.ISSUE_CHANGED, self._make_issue_message(issue)
+        )
+
     @property
     def suggestions(self) -> list[Suggestion]:
         """Return a list of suggestions that can handled."""
@@ -92,6 +100,7 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         """Add suggestion."""
         if suggestion in self._suggestions:
             return
+
         _LOGGER.info(
             "Create new suggestion %s - %s / %s",
             suggestion.type,
@@ -99,6 +108,12 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
             suggestion.reference,
         )
         self._suggestions.append(suggestion)
+
+        # Event on suggestion added to issue
+        for issue in self.issues_for_suggestion(suggestion):
+            self.sys_homeassistant.websocket.supervisor_event(
+                WSEvent.ISSUE_CHANGED, self._make_issue_message(issue)
+            )
 
     @property
     def unsupported(self) -> list[UnsupportedReason]:
@@ -110,6 +125,10 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         """Add a reason for unsupported."""
         if reason not in self._unsupported:
             self._unsupported.append(reason)
+            self.sys_homeassistant.websocket.supervisor_event(
+                WSEvent.SUPPORTED_CHANGED,
+                attr.asdict(SupportedChanged(False, self.unsupported)),
+            )
 
     @property
     def unhealthy(self) -> list[UnhealthyReason]:
@@ -121,6 +140,19 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         """Add a reason for unsupported."""
         if reason not in self._unhealthy:
             self._unhealthy.append(reason)
+            self.sys_homeassistant.websocket.supervisor_event(
+                WSEvent.HEALTH_CHANGED,
+                attr.asdict(HealthChanged(False, self.unhealthy)),
+            )
+
+    def _make_issue_message(self, issue: Issue) -> dict[str, Any]:
+        """Make issue into message for core."""
+        return attr.asdict(issue) | {
+            "suggestions": [
+                attr.asdict(suggestion)
+                for suggestion in self.suggestions_for_issue(issue)
+            ]
+        }
 
     def get_suggestion(self, uuid: str) -> Suggestion:
         """Return suggestion with uuid."""
@@ -142,17 +174,23 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         self,
         issue: IssueType,
         context: ContextType,
-        reference: Optional[str] = None,
-        suggestions: Optional[list[SuggestionType]] = None,
+        reference: str | None = None,
+        suggestions: list[SuggestionType] | None = None,
     ) -> None:
         """Create issues and suggestion."""
-        self.issues = Issue(issue, context, reference)
-        if not suggestions:
-            return
+        self.add_issue(Issue(issue, context, reference), suggestions)
 
-        # Add suggestions
-        for suggestion in suggestions:
-            self.suggestions = Suggestion(suggestion, context, reference)
+    def add_issue(
+        self, issue: Issue, suggestions: list[SuggestionType] | None = None
+    ) -> None:
+        """Add an issue and suggestions."""
+        if suggestions:
+            for suggestion in suggestions:
+                self.suggestions = Suggestion(
+                    suggestion, issue.context, issue.reference
+                )
+
+        self.issues = issue
 
     async def load(self):
         """Load the resoulution manager."""
@@ -191,6 +229,12 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
             )
         self._suggestions.remove(suggestion)
 
+        # Event on suggestion removed from issues
+        for issue in self.issues_for_suggestion(suggestion):
+            self.sys_homeassistant.websocket.supervisor_event(
+                WSEvent.ISSUE_CHANGED, self._make_issue_message(issue)
+            )
+
     def dismiss_issue(self, issue: Issue) -> None:
         """Dismiss suggested action."""
         if issue not in self._issues:
@@ -199,8 +243,42 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
             )
         self._issues.remove(issue)
 
+        # Event on issue removal
+        self.sys_homeassistant.websocket.supervisor_event(
+            WSEvent.ISSUE_REMOVED, attr.asdict(issue)
+        )
+
+        # Clean up any orphaned suggestions
+        for suggestion in self.suggestions_for_issue(issue):
+            if not self.issues_for_suggestion(suggestion):
+                self.dismiss_suggestion(suggestion)
+
     def dismiss_unsupported(self, reason: Issue) -> None:
         """Dismiss a reason for unsupported."""
         if reason not in self._unsupported:
             raise ResolutionError(f"The reason {reason} is not active", _LOGGER.warning)
         self._unsupported.remove(reason)
+        self.sys_homeassistant.websocket.supervisor_event(
+            WSEvent.SUPPORTED_CHANGED,
+            attr.asdict(
+                SupportedChanged(self.sys_core.supported, self.unsupported or None)
+            ),
+        )
+
+    def suggestions_for_issue(self, issue: Issue) -> set[Suggestion]:
+        """Get suggestions that fix an issue."""
+        return {
+            suggestion
+            for fix in self.fixup.fixes_for_issue(issue)
+            for suggestion in fix.all_suggestions
+            if suggestion.reference == issue.reference
+        }
+
+    def issues_for_suggestion(self, suggestion: Suggestion) -> set[Issue]:
+        """Get issues fixed by a suggestion."""
+        return {
+            issue
+            for fix in self.fixup.fixes_for_suggestion(suggestion)
+            for issue in fix.all_issues
+            if issue.reference == suggestion.reference
+        }

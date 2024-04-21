@@ -103,6 +103,40 @@ async def test_raspberrypi4_64_arch(coresys, sys_machine, sys_supervisor):
     assert coresys.arch.supported == ["aarch64", "armv7", "armhf"]
 
 
+async def test_raspberrypi5_64_arch(coresys, sys_machine, sys_supervisor):
+    """Test arch for raspberrypi5_64."""
+    sys_machine.return_value = "raspberrypi5-64"
+    sys_supervisor.arch = "aarch64"
+    await coresys.arch.load()
+
+    assert coresys.arch.default == "aarch64"
+    assert coresys.arch.supported == ["aarch64", "armv7", "armhf"]
+
+
+async def test_yellow_arch(coresys, sys_machine, sys_supervisor):
+    """Test arch for yellow."""
+    sys_machine.return_value = "yellow"
+    sys_supervisor.arch = "aarch64"
+    await coresys.arch.load()
+
+    assert coresys.arch.default == "aarch64"
+    assert coresys.arch.supported == ["aarch64", "armv7", "armhf"]
+    assert coresys.arch.is_supported(["aarch64"]) is True
+    assert coresys.arch.is_supported(["armv7"]) is True
+    assert coresys.arch.is_supported(["armhf"]) is True
+    assert coresys.arch.is_supported(["x86_64", "i386"]) is False
+
+
+async def test_green_arch(coresys, sys_machine, sys_supervisor):
+    """Test arch for green."""
+    sys_machine.return_value = "green"
+    sys_supervisor.arch = "aarch64"
+    await coresys.arch.load()
+
+    assert coresys.arch.default == "aarch64"
+    assert coresys.arch.supported == ["aarch64", "armv7", "armhf"]
+
+
 async def test_tinker_arch(coresys, sys_machine, sys_supervisor):
     """Test arch for tinker."""
     sys_machine.return_value = "tinker"
@@ -126,6 +160,16 @@ async def test_odroid_c2_arch(coresys, sys_machine, sys_supervisor):
 async def test_odroid_c4_arch(coresys, sys_machine, sys_supervisor):
     """Test arch for odroid-c4."""
     sys_machine.return_value = "odroid-c4"
+    sys_supervisor.arch = "aarch64"
+    await coresys.arch.load()
+
+    assert coresys.arch.default == "aarch64"
+    assert coresys.arch.supported == ["aarch64", "armv7", "armhf"]
+
+
+async def test_odroid_m1_arch(coresys, sys_machine, sys_supervisor):
+    """Test arch for odroid-m1."""
+    sys_machine.return_value = "odroid-m1"
     sys_supervisor.arch = "aarch64"
     await coresys.arch.load()
 

@@ -1,85 +1,94 @@
 """Small wrapper for CodeNotary."""
-# pylint:  disable=unreachable
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import json
 import logging
 from pathlib import Path
 import shlex
-from typing import Optional, Union
+from typing import Final
 
-import async_timeout
+from dirhash import dirhash
 
-from . import clean_env
 from ..exceptions import CodeNotaryBackendError, CodeNotaryError, CodeNotaryUntrusted
+from . import clean_env
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-_VCN_CMD: str = "vcn authenticate --silent --output json"
-_CACHE: set[tuple[str, Path, str, str]] = set()
+_CAS_CMD: str = (
+    "cas authenticate --signerID {signer} --silent --output json --hash {sum}"
+)
+_CACHE: set[tuple[str, str]] = set()
 
 
-_ATTR_ERROR = "error"
-_ATTR_VERIFICATION = "verification"
-_ATTR_STATUS = "status"
+_ATTR_ERROR: Final = "error"
+_ATTR_STATUS: Final = "status"
+_FALLBACK_ERROR: Final = "Unknown CodeNotary backend issue"
 
 
-def calc_checksum(data: Union[str, bytes]) -> str:
+def calc_checksum(data: str | bytes) -> str:
     """Generate checksum for CodeNotary."""
     if isinstance(data, str):
         return hashlib.sha256(data.encode()).hexdigest()
     return hashlib.sha256(data).hexdigest()
 
 
-async def vcn_validate(
-    checksum: Optional[str] = None,
-    path: Optional[Path] = None,
-    org: Optional[str] = None,
-    signer: Optional[str] = None,
+def calc_checksum_path_sourcecode(folder: Path) -> str:
+    """Calculate checksum for a path source code.
+
+    Need catch OSError.
+    """
+    return dirhash(folder.as_posix(), "sha256", match=["*.py"])
+
+
+# pylint: disable=unreachable
+async def cas_validate(
+    signer: str,
+    checksum: str,
 ) -> None:
     """Validate data against CodeNotary."""
-    return None
-    if (checksum, path, org, signer) in _CACHE:
+    return
+    if (checksum, signer) in _CACHE:
         return
-    command = shlex.split(_VCN_CMD)
 
     # Generate command for request
-    if org:
-        command.extend(["--org", org])
-    elif signer:
-        command.extend(["--signerID", signer])
-
-    if checksum:
-        command.extend(["--hash", checksum])
-    elif path:
-        if path.is_dir:
-            command.append(f"dir://{path.as_posix()}")
-        else:
-            command.append(path.as_posix())
-    else:
-        RuntimeError("At least path or checksum need to be set!")
+    command = shlex.split(_CAS_CMD.format(signer=signer, sum=checksum))
 
     # Request notary authorization
-    _LOGGER.debug("Send vcn command: %s", command)
+    _LOGGER.debug("Send cas command: %s", command)
     try:
         proc = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
             env=clean_env(),
         )
 
-        async with async_timeout.timeout(10):
-            data, _ = await proc.communicate()
+        async with asyncio.timeout(15):
+            data, error = await proc.communicate()
+    except TimeoutError:
+        raise CodeNotaryBackendError(
+            "Timeout while processing CodeNotary", _LOGGER.warning
+        ) from None
     except OSError as err:
         raise CodeNotaryError(
             f"CodeNotary fatal error: {err!s}", _LOGGER.critical
         ) from err
-    except asyncio.TimeoutError:
-        raise CodeNotaryError(
-            "Timeout while processing CodeNotary", _LOGGER.error
-        ) from None
+
+    # Check if Notarized
+    if proc.returncode != 0 and not data:
+        if error:
+            try:
+                error = error.decode("utf-8")
+            except UnicodeDecodeError as err:
+                raise CodeNotaryBackendError(_FALLBACK_ERROR, _LOGGER.warning) from err
+            if "not notarized" in error:
+                raise CodeNotaryUntrusted()
+        else:
+            error = _FALLBACK_ERROR
+        raise CodeNotaryBackendError(error, _LOGGER.warning)
 
     # Parse data
     try:
@@ -93,7 +102,7 @@ async def vcn_validate(
     if _ATTR_ERROR in data_json:
         raise CodeNotaryBackendError(data_json[_ATTR_ERROR], _LOGGER.warning)
 
-    if data_json[_ATTR_VERIFICATION][_ATTR_STATUS] == 0:
-        _CACHE.add((checksum, path, org, signer))
+    if data_json[_ATTR_STATUS] == 0:
+        _CACHE.add((checksum, signer))
     else:
         raise CodeNotaryUntrusted()

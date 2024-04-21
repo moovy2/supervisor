@@ -1,7 +1,8 @@
 """Init file for Supervisor Home Assistant RESTful API."""
 import asyncio
+from collections.abc import Awaitable
 import logging
-from typing import Any, Awaitable
+from typing import Any
 
 from aiohttp import web
 import voluptuous as vol
@@ -11,6 +12,7 @@ from ..const import (
     ATTR_AUDIO_INPUT,
     ATTR_AUDIO_OUTPUT,
     ATTR_BACKUP,
+    ATTR_BACKUPS_EXCLUDE_DATABASE,
     ATTR_BLK_READ,
     ATTR_BLK_WRITE,
     ATTR_BOOT,
@@ -29,14 +31,13 @@ from ..const import (
     ATTR_UPDATE_AVAILABLE,
     ATTR_VERSION,
     ATTR_VERSION_LATEST,
-    ATTR_WAIT_BOOT,
     ATTR_WATCHDOG,
-    CONTENT_TYPE_BINARY,
 )
 from ..coresys import CoreSysAttributes
 from ..exceptions import APIError
 from ..validate import docker_image, network_port, version_tag
-from .utils import api_process, api_process_raw, api_validate
+from .const import ATTR_SAFE_MODE
+from .utils import api_process, api_validate
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -48,10 +49,10 @@ SCHEMA_OPTIONS = vol.Schema(
         vol.Optional(ATTR_PORT): network_port,
         vol.Optional(ATTR_SSL): vol.Boolean(),
         vol.Optional(ATTR_WATCHDOG): vol.Boolean(),
-        vol.Optional(ATTR_WAIT_BOOT): vol.All(vol.Coerce(int), vol.Range(min=60)),
         vol.Optional(ATTR_REFRESH_TOKEN): vol.Maybe(str),
         vol.Optional(ATTR_AUDIO_OUTPUT): vol.Maybe(str),
         vol.Optional(ATTR_AUDIO_INPUT): vol.Maybe(str),
+        vol.Optional(ATTR_BACKUPS_EXCLUDE_DATABASE): vol.Boolean(),
     }
 )
 
@@ -59,6 +60,12 @@ SCHEMA_UPDATE = vol.Schema(
     {
         vol.Optional(ATTR_VERSION): version_tag,
         vol.Optional(ATTR_BACKUP): bool,
+    }
+)
+
+SCHEMA_RESTART = vol.Schema(
+    {
+        vol.Optional(ATTR_SAFE_MODE, default=False): vol.Boolean(),
     }
 )
 
@@ -81,11 +88,9 @@ class APIHomeAssistant(CoreSysAttributes):
             ATTR_PORT: self.sys_homeassistant.api_port,
             ATTR_SSL: self.sys_homeassistant.api_ssl,
             ATTR_WATCHDOG: self.sys_homeassistant.watchdog,
-            ATTR_WAIT_BOOT: self.sys_homeassistant.wait_boot,
             ATTR_AUDIO_INPUT: self.sys_homeassistant.audio_input,
             ATTR_AUDIO_OUTPUT: self.sys_homeassistant.audio_output,
-            # Remove end of Q3 2020
-            "last_version": self.sys_homeassistant.latest_version,
+            ATTR_BACKUPS_EXCLUDE_DATABASE: self.sys_homeassistant.backups_exclude_database,
         }
 
     @api_process
@@ -95,6 +100,9 @@ class APIHomeAssistant(CoreSysAttributes):
 
         if ATTR_IMAGE in body:
             self.sys_homeassistant.image = body[ATTR_IMAGE]
+            self.sys_homeassistant.override_image = (
+                self.sys_homeassistant.image != self.sys_homeassistant.default_image
+            )
 
         if ATTR_BOOT in body:
             self.sys_homeassistant.boot = body[ATTR_BOOT]
@@ -108,9 +116,6 @@ class APIHomeAssistant(CoreSysAttributes):
         if ATTR_WATCHDOG in body:
             self.sys_homeassistant.watchdog = body[ATTR_WATCHDOG]
 
-        if ATTR_WAIT_BOOT in body:
-            self.sys_homeassistant.wait_boot = body[ATTR_WAIT_BOOT]
-
         if ATTR_REFRESH_TOKEN in body:
             self.sys_homeassistant.refresh_token = body[ATTR_REFRESH_TOKEN]
 
@@ -119,6 +124,11 @@ class APIHomeAssistant(CoreSysAttributes):
 
         if ATTR_AUDIO_OUTPUT in body:
             self.sys_homeassistant.audio_output = body[ATTR_AUDIO_OUTPUT]
+
+        if ATTR_BACKUPS_EXCLUDE_DATABASE in body:
+            self.sys_homeassistant.backups_exclude_database = body[
+                ATTR_BACKUPS_EXCLUDE_DATABASE
+            ]
 
         self.sys_homeassistant.save_data()
 
@@ -163,19 +173,18 @@ class APIHomeAssistant(CoreSysAttributes):
         return asyncio.shield(self.sys_homeassistant.core.start())
 
     @api_process
-    def restart(self, request: web.Request) -> Awaitable[None]:
+    async def restart(self, request: web.Request) -> None:
         """Restart Home Assistant."""
-        return asyncio.shield(self.sys_homeassistant.core.restart())
+        body = await api_validate(SCHEMA_RESTART, request)
+
+        await asyncio.shield(
+            self.sys_homeassistant.core.restart(safe_mode=body[ATTR_SAFE_MODE])
+        )
 
     @api_process
     def rebuild(self, request: web.Request) -> Awaitable[None]:
         """Rebuild Home Assistant."""
         return asyncio.shield(self.sys_homeassistant.core.rebuild())
-
-    @api_process_raw(CONTENT_TYPE_BINARY)
-    def logs(self, request: web.Request) -> Awaitable[bytes]:
-        """Return Home Assistant Docker logs."""
-        return self.sys_homeassistant.core.logs()
 
     @api_process
     async def check(self, request: web.Request) -> None:

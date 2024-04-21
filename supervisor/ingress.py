@@ -3,10 +3,15 @@ from datetime import timedelta
 import logging
 import random
 import secrets
-from typing import Optional
 
 from .addons.addon import Addon
-from .const import ATTR_PORTS, ATTR_SESSION, FILE_HASSIO_INGRESS
+from .const import (
+    ATTR_PORTS,
+    ATTR_SESSION,
+    ATTR_SESSION_DATA,
+    FILE_HASSIO_INGRESS,
+    IngressSessionData,
+)
 from .coresys import CoreSys, CoreSysAttributes
 from .utils import check_port
 from .utils.common import FileConfiguration
@@ -25,16 +30,27 @@ class Ingress(FileConfiguration, CoreSysAttributes):
         self.coresys: CoreSys = coresys
         self.tokens: dict[str, str] = {}
 
-    def get(self, token: str) -> Optional[Addon]:
+    def get(self, token: str) -> Addon | None:
         """Return addon they have this ingress token."""
         if token not in self.tokens:
             return None
         return self.sys_addons.get(self.tokens[token], local_only=True)
 
+    def get_session_data(self, session_id: str) -> IngressSessionData | None:
+        """Return complementary data of current session or None."""
+        if data := self.sessions_data.get(session_id):
+            return IngressSessionData.from_dict(data)
+        return None
+
     @property
     def sessions(self) -> dict[str, float]:
         """Return sessions."""
         return self._data[ATTR_SESSION]
+
+    @property
+    def sessions_data(self) -> dict[str, dict[str, str | None]]:
+        """Return sessions_data."""
+        return self._data[ATTR_SESSION_DATA]
 
     @property
     def ports(self) -> dict[str, int]:
@@ -72,6 +88,7 @@ class Ingress(FileConfiguration, CoreSysAttributes):
         now = utcnow()
 
         sessions = {}
+        sessions_data: dict[str, dict[str, str | None]] = {}
         for session, valid in self.sessions.items():
             # check if timestamp valid, to avoid crash on malformed timestamp
             try:
@@ -85,10 +102,14 @@ class Ingress(FileConfiguration, CoreSysAttributes):
 
             # Is valid
             sessions[session] = valid
+            if session_data := self.sessions_data.get(session):
+                sessions_data[session] = session_data
 
         # Write back
         self.sessions.clear()
         self.sessions.update(sessions)
+        self.sessions_data.clear()
+        self.sessions_data.update(sessions_data)
 
     def _update_token_list(self) -> None:
         """Regenerate token <-> Add-on map."""
@@ -98,12 +119,15 @@ class Ingress(FileConfiguration, CoreSysAttributes):
         for addon in self.addons:
             self.tokens[addon.ingress_token] = addon.slug
 
-    def create_session(self) -> str:
+    def create_session(self, data: IngressSessionData | None = None) -> str:
         """Create new session."""
         session = secrets.token_hex(64)
         valid = utcnow() + timedelta(minutes=15)
 
         self.sessions[session] = valid.timestamp()
+        if data is not None:
+            self.sessions_data[session] = data.to_dict()
+
         return session
 
     def validate_session(self, session: str) -> bool:
@@ -130,7 +154,7 @@ class Ingress(FileConfiguration, CoreSysAttributes):
 
         return True
 
-    def get_dynamic_port(self, addon_slug: str) -> int:
+    async def get_dynamic_port(self, addon_slug: str) -> int:
         """Get/Create a dynamic port from range."""
         if addon_slug in self.ports:
             return self.ports[addon_slug]
@@ -139,7 +163,7 @@ class Ingress(FileConfiguration, CoreSysAttributes):
         while (
             port is None
             or port in self.ports.values()
-            or check_port(self.sys_docker.network.gateway, port)
+            or await check_port(self.sys_docker.network.gateway, port)
         ):
             port = random.randint(62000, 65500)
 

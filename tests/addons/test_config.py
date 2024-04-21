@@ -1,5 +1,6 @@
 """Validate Add-on configs."""
 
+
 import pytest
 import voluptuous as vol
 
@@ -23,6 +24,7 @@ def test_basic_config():
     assert not valid_config["host_ipc"]
     assert not valid_config["host_dbus"]
     assert not valid_config["host_pid"]
+    assert not valid_config["host_uts"]
 
     assert not valid_config["hassio_api"]
     assert not valid_config["homeassistant_api"]
@@ -37,13 +39,13 @@ def test_migration_startup():
 
     valid_config = vd.SCHEMA_ADDON_CONFIG(config)
 
-    assert valid_config["startup"].value == "services"
+    assert valid_config["startup"] == "services"
 
     config["startup"] = "after"
 
     valid_config = vd.SCHEMA_ADDON_CONFIG(config)
 
-    assert valid_config["startup"].value == "application"
+    assert valid_config["startup"] == "application"
 
 
 def test_migration_auto_uart():
@@ -106,7 +108,7 @@ def test_invalid_repository():
     """Validate basic config with invalid repositories."""
     config = load_json_fixture("basic-addon-config.json")
 
-    config["image"] = "something"
+    config["image"] = "-invalid-something"
     with pytest.raises(vol.Invalid):
         vd.SCHEMA_ADDON_CONFIG(config)
 
@@ -146,6 +148,13 @@ def test_valid_basic_build():
     vd.SCHEMA_BUILD_CONFIG(config)
 
 
+async def test_valid_manifest_build():
+    """Validate build config with manifest build from."""
+    config = load_json_fixture("build-config-manifest.json")
+
+    vd.SCHEMA_BUILD_CONFIG(config)
+
+
 def test_valid_machine():
     """Validate valid machine config."""
     config = load_json_fixture("basic-addon-config.json")
@@ -165,6 +174,7 @@ def test_valid_machine():
         "raspberrypi3",
         "raspberrypi4-64",
         "raspberrypi4",
+        "raspberrypi5-64",
         "tinker",
     ]
 
@@ -185,6 +195,7 @@ def test_valid_machine():
         "!raspberrypi3",
         "!raspberrypi4-64",
         "!raspberrypi4",
+        "!raspberrypi5-64",
         "!tinker",
     ]
 
@@ -200,6 +211,7 @@ def test_valid_machine():
         "raspberrypi",
         "raspberrypi4-64",
         "raspberrypi4",
+        "raspberrypi5-64",
         "!tinker",
     ]
 
@@ -240,4 +252,37 @@ def test_watchdog_url():
         "https://[HOST]:[PORT:80]/",
     ):
         config["watchdog"] = test_options
+        assert vd.SCHEMA_ADDON_CONFIG(config)
+
+
+def test_valid_slug():
+    """Test valid and invalid addon slugs."""
+    config = load_json_fixture("basic-addon-config.json")
+
+    # All examples pulled from https://analytics.home-assistant.io/addons.json
+    config["slug"] = "uptime-kuma"
+    assert vd.SCHEMA_ADDON_CONFIG(config)
+
+    config["slug"] = "hassio_google_drive_backup"
+    assert vd.SCHEMA_ADDON_CONFIG(config)
+
+    config["slug"] = "paradox_alarm_interface_3.x"
+    assert vd.SCHEMA_ADDON_CONFIG(config)
+
+    config["slug"] = "Lupusec2Mqtt"
+    assert vd.SCHEMA_ADDON_CONFIG(config)
+
+    # No whitespace
+    config["slug"] = "my addon"
+    with pytest.raises(vol.Invalid):
+        assert vd.SCHEMA_ADDON_CONFIG(config)
+
+    # No url control chars (or other non-word ascii characters)
+    config["slug"] = "a/b_&_c\\d_@ddon$:_test=#2?"
+    with pytest.raises(vol.Invalid):
+        assert vd.SCHEMA_ADDON_CONFIG(config)
+
+    # No unicode
+    config["slug"] = "complemento telefónico"
+    with pytest.raises(vol.Invalid):
         assert vd.SCHEMA_ADDON_CONFIG(config)

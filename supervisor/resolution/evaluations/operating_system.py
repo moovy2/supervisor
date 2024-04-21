@@ -5,7 +5,7 @@ from ...coresys import CoreSys
 from ..const import UnsupportedReason
 from .base import EvaluateBase
 
-SUPPORTED_OS = ["Debian GNU/Linux 10 (buster)", "Debian GNU/Linux 11 (bullseye)"]
+SUPPORTED_OS = ["Debian GNU/Linux 11 (bullseye)", "Debian GNU/Linux 12 (bookworm)"]
 
 
 def setup(coresys: CoreSys) -> EvaluateBase:
@@ -23,7 +23,7 @@ class EvaluateOperatingSystem(EvaluateBase):
 
     @property
     def on_failure(self) -> str:
-        """Return a string that is printed when self.evaluate is False."""
+        """Return a string that is printed when self.evaluate is True."""
         return f"Detected unsupported OS: {self.sys_host.info.operating_system}"
 
     @property

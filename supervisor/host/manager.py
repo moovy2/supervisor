@@ -3,15 +3,18 @@ from contextlib import suppress
 from functools import lru_cache
 import logging
 
+from awesomeversion import AwesomeVersion
+
 from ..const import BusEvent
 from ..coresys import CoreSys, CoreSysAttributes
-from ..exceptions import HassioError, PulseAudioError
+from ..exceptions import HassioError, HostLogError, PulseAudioError
 from ..hardware.const import PolicyGroup
 from ..hardware.data import Device
 from .apparmor import AppArmorControl
 from .const import HostFeature
 from .control import SystemControl
 from .info import InfoCenter
+from .logs import LogsControl
 from .network import NetworkManager
 from .services import ServiceManager
 from .sound import SoundControl
@@ -32,6 +35,7 @@ class HostManager(CoreSysAttributes):
         self._services: ServiceManager = ServiceManager(coresys)
         self._network: NetworkManager = NetworkManager(coresys)
         self._sound: SoundControl = SoundControl(coresys)
+        self._logs: LogsControl = LogsControl(coresys)
 
     @property
     def apparmor(self) -> AppArmorControl:
@@ -64,11 +68,16 @@ class HostManager(CoreSysAttributes):
         return self._sound
 
     @property
+    def logs(self) -> LogsControl:
+        """Return host logs handler."""
+        return self._logs
+
+    @property
     def features(self) -> list[HostFeature]:
         """Return a list of host features."""
         return self.supported_features()
 
-    @lru_cache
+    @lru_cache(maxsize=128)
     def supported_features(self) -> list[HostFeature]:
         """Return a list of supported host features."""
         features = []
@@ -93,11 +102,32 @@ class HostManager(CoreSysAttributes):
         if self.sys_os.available:
             features.append(HostFeature.HAOS)
 
+        if self.sys_dbus.resolved.is_connected:
+            features.append(HostFeature.RESOLVED)
+
+        if self.logs.available:
+            features.append(HostFeature.JOURNAL)
+
+        if self.sys_dbus.udisks2.is_connected:
+            features.append(HostFeature.DISK)
+
+        # Support added in OS10. Propagation mode changed on mount in 10.2 to support this
+        if (
+            self.sys_dbus.systemd.is_connected
+            and self.sys_supervisor.instance.host_mounts_available
+            and (
+                not self.sys_os.available
+                or self.sys_os.version >= AwesomeVersion("10.2")
+            )
+        ):
+            features.append(HostFeature.MOUNT)
+
         return features
 
     async def reload(self):
         """Reload host functions."""
         await self.info.update()
+        await self.sys_os.reload()
 
         if self.sys_dbus.systemd.is_connected:
             await self.services.update()
@@ -108,6 +138,9 @@ class HostManager(CoreSysAttributes):
         if self.sys_dbus.agent.is_connected:
             await self.sys_dbus.agent.update()
 
+        if self.sys_dbus.udisks2.is_connected:
+            await self.sys_dbus.udisks2.update()
+
         with suppress(PulseAudioError):
             await self.sound.update()
 
@@ -117,7 +150,16 @@ class HostManager(CoreSysAttributes):
     async def load(self):
         """Load host information."""
         with suppress(HassioError):
-            await self.reload()
+            if self.sys_dbus.systemd.is_connected:
+                await self.services.update()
+
+            with suppress(PulseAudioError):
+                await self.sound.update()
+
+            with suppress(HostLogError):
+                await self.logs.load()
+
+            await self.network.load()
 
         # Register for events
         self.sys_bus.register_event(BusEvent.HARDWARE_NEW_DEVICE, self._hardware_events)
@@ -134,4 +176,4 @@ class HostManager(CoreSysAttributes):
     async def _hardware_events(self, device: Device) -> None:
         """Process hardware requests."""
         if self.sys_hardware.policy.is_match_cgroup(PolicyGroup.AUDIO, device):
-            await self.sound.update()
+            await self.sound.update(reload_pulse=True)

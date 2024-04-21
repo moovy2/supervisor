@@ -3,36 +3,43 @@ FROM ${BUILD_FROM}
 
 ENV \
     S6_SERVICES_GRACETIME=10000 \
-    SUPERVISOR_API=http://localhost
+    SUPERVISOR_API=http://localhost \
+    CRYPTOGRAPHY_OPENSSL_NO_LEGACY=1
 
-ARG BUILD_ARCH
-WORKDIR /usr/src
+ARG \
+    COSIGN_VERSION \
+    BUILD_ARCH
 
 # Install base
+WORKDIR /usr/src
 RUN \
     set -x \
     && apk add --no-cache \
+        findutils \
         eudev \
         eudev-libs \
         git \
         libffi \
         libpulse \
         musl \
-        openssl
+        openssl \
+        yaml \
+    \
+    && curl -Lso /usr/bin/cosign "https://github.com/home-assistant/cosign/releases/download/${COSIGN_VERSION}/cosign_${BUILD_ARCH}" \
+    && chmod a+x /usr/bin/cosign
 
 # Install requirements
 COPY requirements.txt .
 RUN \
     export MAKEFLAGS="-j$(nproc)" \
-    && pip3 install --no-cache-dir --no-index --only-binary=:all: --find-links \
-        "https://wheels.home-assistant.io/alpine-$(cut -d '.' -f 1-2 < /etc/alpine-release)/${BUILD_ARCH}/" \
+    && pip3 install --only-binary=:all: \
         -r ./requirements.txt \
     && rm -f requirements.txt
 
 # Install Home Assistant Supervisor
 COPY . supervisor
 RUN \
-    pip3 install --no-cache-dir -e ./supervisor \
+    pip3 install -e ./supervisor \
     && python3 -m compileall ./supervisor/supervisor
 
 

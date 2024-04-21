@@ -1,10 +1,11 @@
 """Init file for Supervisor Audio RESTful API."""
 import asyncio
+from collections.abc import Awaitable
+from dataclasses import asdict
 import logging
-from typing import Any, Awaitable
+from typing import Any
 
 from aiohttp import web
-import attr
 import voluptuous as vol
 
 from ..const import (
@@ -29,13 +30,12 @@ from ..const import (
     ATTR_VERSION,
     ATTR_VERSION_LATEST,
     ATTR_VOLUME,
-    CONTENT_TYPE_BINARY,
 )
 from ..coresys import CoreSysAttributes
 from ..exceptions import APIError
 from ..host.sound import StreamType
 from ..validate import version_tag
-from .utils import api_process, api_process_raw, api_validate
+from .utils import api_process, api_validate
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -75,15 +75,11 @@ class APIAudio(CoreSysAttributes):
             ATTR_UPDATE_AVAILABLE: self.sys_plugins.audio.need_update,
             ATTR_HOST: str(self.sys_docker.network.audio),
             ATTR_AUDIO: {
-                ATTR_CARD: [attr.asdict(card) for card in self.sys_host.sound.cards],
-                ATTR_INPUT: [
-                    attr.asdict(stream) for stream in self.sys_host.sound.inputs
-                ],
-                ATTR_OUTPUT: [
-                    attr.asdict(stream) for stream in self.sys_host.sound.outputs
-                ],
+                ATTR_CARD: [asdict(card) for card in self.sys_host.sound.cards],
+                ATTR_INPUT: [asdict(stream) for stream in self.sys_host.sound.inputs],
+                ATTR_OUTPUT: [asdict(stream) for stream in self.sys_host.sound.outputs],
                 ATTR_APPLICATION: [
-                    attr.asdict(stream) for stream in self.sys_host.sound.applications
+                    asdict(stream) for stream in self.sys_host.sound.applications
                 ],
             },
         }
@@ -113,11 +109,6 @@ class APIAudio(CoreSysAttributes):
         if version == self.sys_plugins.audio.version:
             raise APIError(f"Version {version} is already in use")
         await asyncio.shield(self.sys_plugins.audio.update(version))
-
-    @api_process_raw(CONTENT_TYPE_BINARY)
-    def logs(self, request: web.Request) -> Awaitable[bytes]:
-        """Return Audio Docker logs."""
-        return self.sys_plugins.audio.logs()
 
     @api_process
     def restart(self, request: web.Request) -> Awaitable[None]:

@@ -2,7 +2,7 @@
 import asyncio
 from ipaddress import ip_address
 import logging
-from typing import Any, Union
+from typing import Any
 
 import aiohttp
 from aiohttp import ClientTimeout, hdrs, web
@@ -21,21 +21,64 @@ from ..const import (
     ATTR_ICON,
     ATTR_PANELS,
     ATTR_SESSION,
+    ATTR_SESSION_DATA_USER_ID,
     ATTR_TITLE,
-    COOKIE_INGRESS,
+    HEADER_REMOTE_USER_DISPLAY_NAME,
+    HEADER_REMOTE_USER_ID,
+    HEADER_REMOTE_USER_NAME,
     HEADER_TOKEN,
     HEADER_TOKEN_OLD,
+    IngressSessionData,
+    IngressSessionDataUser,
 )
 from ..coresys import CoreSysAttributes
+from ..exceptions import HomeAssistantAPIError
+from .const import COOKIE_INGRESS
 from .utils import api_process, api_validate, require_home_assistant
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 VALIDATE_SESSION_DATA = vol.Schema({ATTR_SESSION: str})
 
+"""Expected optional payload of create session request"""
+SCHEMA_INGRESS_CREATE_SESSION_DATA = vol.Schema(
+    {
+        vol.Optional(ATTR_SESSION_DATA_USER_ID): str,
+    }
+)
+
+
+# from https://github.com/aio-libs/aiohttp/blob/8ae650bee4add9f131d49b96a0a150311ea58cd1/aiohttp/helpers.py#L1059C1-L1079C1
+def must_be_empty_body(method: str, code: int) -> bool:
+    """Check if a request must return an empty body."""
+    return (
+        status_code_must_be_empty_body(code)
+        or method_must_be_empty_body(method)
+        or (200 <= code < 300 and method.upper() == hdrs.METH_CONNECT)
+    )
+
+
+def method_must_be_empty_body(method: str) -> bool:
+    """Check if a method must return an empty body."""
+    # https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.1
+    # https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.2
+    return method.upper() == hdrs.METH_HEAD
+
+
+def status_code_must_be_empty_body(code: int) -> bool:
+    """Check if a status code must return an empty body."""
+    # https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.1
+    return code in {204, 304} or 100 <= code < 200
+
 
 class APIIngress(CoreSysAttributes):
     """Ingress view to handle add-on webui routing."""
+
+    _list_of_users: list[IngressSessionDataUser]
+
+    def __init__(self) -> None:
+        """Initialize APIIngress."""
+        self._list_of_users = []
 
     def _extract_addon(self, request: web.Request) -> Addon:
         """Return addon, throw an exception it it doesn't exist."""
@@ -71,7 +114,19 @@ class APIIngress(CoreSysAttributes):
     @require_home_assistant
     async def create_session(self, request: web.Request) -> dict[str, Any]:
         """Create a new session."""
-        session = self.sys_ingress.create_session()
+        schema_ingress_config_session_data = await api_validate(
+            SCHEMA_INGRESS_CREATE_SESSION_DATA, request
+        )
+        data: IngressSessionData | None = None
+
+        if ATTR_SESSION_DATA_USER_ID in schema_ingress_config_session_data:
+            user = await self._find_user_by_id(
+                schema_ingress_config_session_data[ATTR_SESSION_DATA_USER_ID]
+            )
+            if user:
+                data = IngressSessionData(user)
+
+        session = self.sys_ingress.create_session(data)
         return {ATTR_SESSION: session}
 
     @api_process
@@ -85,10 +140,9 @@ class APIIngress(CoreSysAttributes):
             _LOGGER.warning("No valid ingress session %s", data[ATTR_SESSION])
             raise HTTPUnauthorized()
 
-    @require_home_assistant
     async def handler(
         self, request: web.Request
-    ) -> Union[web.Response, web.StreamResponse, web.WebSocketResponse]:
+    ) -> web.Response | web.StreamResponse | web.WebSocketResponse:
         """Route data to Supervisor ingress service."""
 
         # Check Ingress Session
@@ -100,13 +154,14 @@ class APIIngress(CoreSysAttributes):
         # Process requests
         addon = self._extract_addon(request)
         path = request.match_info.get("path")
+        session_data = self.sys_ingress.get_session_data(session)
         try:
             # Websocket
             if _is_websocket(request):
-                return await self._handle_websocket(request, addon, path)
+                return await self._handle_websocket(request, addon, path, session_data)
 
             # Request
-            return await self._handle_request(request, addon, path)
+            return await self._handle_request(request, addon, path, session_data)
 
         except aiohttp.ClientError as err:
             _LOGGER.error("Ingress error: %s", err)
@@ -114,7 +169,11 @@ class APIIngress(CoreSysAttributes):
         raise HTTPBadGateway()
 
     async def _handle_websocket(
-        self, request: web.Request, addon: Addon, path: str
+        self,
+        request: web.Request,
+        addon: Addon,
+        path: str,
+        session_data: IngressSessionData | None,
     ) -> web.WebSocketResponse:
         """Ingress route for websocket."""
         if hdrs.SEC_WEBSOCKET_PROTOCOL in request.headers:
@@ -132,7 +191,7 @@ class APIIngress(CoreSysAttributes):
 
         # Preparing
         url = self._create_url(addon, path)
-        source_header = _init_header(request, addon)
+        source_header = _init_header(request, addon, session_data)
 
         # Support GET query
         if request.query_string:
@@ -149,8 +208,8 @@ class APIIngress(CoreSysAttributes):
             # Proxy requests
             await asyncio.wait(
                 [
-                    _websocket_forward(ws_server, ws_client),
-                    _websocket_forward(ws_client, ws_server),
+                    self.sys_create_task(_websocket_forward(ws_server, ws_client)),
+                    self.sys_create_task(_websocket_forward(ws_client, ws_server)),
                 ],
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -158,11 +217,15 @@ class APIIngress(CoreSysAttributes):
         return ws_server
 
     async def _handle_request(
-        self, request: web.Request, addon: Addon, path: str
-    ) -> Union[web.Response, web.StreamResponse]:
+        self,
+        request: web.Request,
+        addon: Addon,
+        path: str,
+        session_data: IngressSessionData | None,
+    ) -> web.Response | web.StreamResponse:
         """Ingress route for request."""
         url = self._create_url(addon, path)
-        source_header = _init_header(request, addon)
+        source_header = _init_header(request, addon, session_data)
 
         # Passing the raw stream breaks requests for some webservers
         # since we just need it for POST requests really, for all other methods
@@ -182,12 +245,21 @@ class APIIngress(CoreSysAttributes):
             allow_redirects=False,
             data=data,
             timeout=ClientTimeout(total=None),
+            skip_auto_headers={hdrs.CONTENT_TYPE},
         ) as result:
             headers = _response_header(result)
-
+            # Avoid parsing content_type in simple cases for better performance
+            if maybe_content_type := result.headers.get(hdrs.CONTENT_TYPE):
+                content_type = (maybe_content_type.partition(";"))[0].strip()
+            else:
+                content_type = result.content_type
             # Simple request
             if (
-                hdrs.CONTENT_LENGTH in result.headers
+                # empty body responses should not be streamed,
+                # otherwise aiohttp < 3.9.0 may generate
+                # an invalid "0\r\n\r\n" chunk instead of an empty response.
+                must_be_empty_body(request.method, result.status)
+                or hdrs.CONTENT_LENGTH in result.headers
                 and int(result.headers.get(hdrs.CONTENT_LENGTH, 0)) < 4_194_000
             ):
                 # Return Response
@@ -195,13 +267,13 @@ class APIIngress(CoreSysAttributes):
                 return web.Response(
                     headers=headers,
                     status=result.status,
-                    content_type=result.content_type,
+                    content_type=content_type,
                     body=body,
                 )
 
             # Stream response
             response = web.StreamResponse(status=result.status, headers=headers)
-            response.content_type = result.content_type
+            response.content_type = content_type
 
             try:
                 await response.prepare(request)
@@ -217,12 +289,34 @@ class APIIngress(CoreSysAttributes):
 
             return response
 
+    async def _find_user_by_id(self, user_id: str) -> IngressSessionDataUser | None:
+        """Find user object by the user's ID."""
+        try:
+            list_of_users = await self.sys_homeassistant.get_users()
+        except (HomeAssistantAPIError, TypeError) as err:
+            _LOGGER.error(
+                "%s error occurred while requesting list of users: %s", type(err), err
+            )
+            return None
+
+        if list_of_users is not None:
+            self._list_of_users = list_of_users
+
+        return next((user for user in self._list_of_users if user.id == user_id), None)
+
 
 def _init_header(
-    request: web.Request, addon: str
-) -> Union[CIMultiDict, dict[str, str]]:
+    request: web.Request, addon: Addon, session_data: IngressSessionData | None
+) -> CIMultiDict | dict[str, str]:
     """Create initial header."""
     headers = {}
+
+    if session_data is not None:
+        headers[HEADER_REMOTE_USER_ID] = session_data.user.id
+        if session_data.user.username is not None:
+            headers[HEADER_REMOTE_USER_NAME] = session_data.user.username
+        if session_data.user.display_name is not None:
+            headers[HEADER_REMOTE_USER_DISPLAY_NAME] = session_data.user.display_name
 
     # filter flags
     for name, value in request.headers.items():
@@ -236,6 +330,9 @@ def _init_header(
             hdrs.SEC_WEBSOCKET_KEY,
             istr(HEADER_TOKEN),
             istr(HEADER_TOKEN_OLD),
+            istr(HEADER_REMOTE_USER_ID),
+            istr(HEADER_REMOTE_USER_NAME),
+            istr(HEADER_REMOTE_USER_DISPLAY_NAME),
         ):
             continue
         headers[name] = value

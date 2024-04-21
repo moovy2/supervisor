@@ -1,7 +1,6 @@
 """Helpers to check core security."""
 from datetime import timedelta
 import logging
-from typing import Optional
 
 from ...const import AddonState, CoreState
 from ...coresys import CoreSys
@@ -23,6 +22,7 @@ class CheckAddonPwned(CheckBase):
     """CheckAddonPwned class for check."""
 
     @Job(
+        name="check_addon_pwned_run",
         conditions=[JobCondition.INTERNET_SYSTEM],
         limit=JobExecutionLimit.THROTTLE,
         throttle_period=timedelta(hours=24),
@@ -63,8 +63,8 @@ class CheckAddonPwned(CheckBase):
                 except PwnedError:
                     pass
 
-    @Job(conditions=[JobCondition.INTERNET_SYSTEM])
-    async def approve_check(self, reference: Optional[str] = None) -> bool:
+    @Job(name="check_addon_pwned_approve", conditions=[JobCondition.INTERNET_SYSTEM])
+    async def approve_check(self, reference: str | None = None) -> bool:
         """Approve check if it is affected by issue."""
         addon = self.sys_addons.get(reference)
 

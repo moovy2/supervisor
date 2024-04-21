@@ -1,8 +1,12 @@
 """Observer docker object."""
 import logging
 
-from ..const import DOCKER_NETWORK_MASK, ENV_TIME, ENV_TOKEN
+from ..const import DOCKER_NETWORK_MASK
 from ..coresys import CoreSysAttributes
+from ..exceptions import DockerJobError
+from ..jobs.const import JobExecutionLimit
+from ..jobs.decorator import Job
+from .const import ENV_TIME, ENV_TOKEN, MOUNT_DOCKER, RestartPolicy
 from .interface import DockerInterface
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -24,20 +28,14 @@ class DockerObserver(DockerInterface, CoreSysAttributes):
         """Return name of Docker container."""
         return OBSERVER_DOCKER_NAME
 
-    def _run(self) -> None:
-        """Run Docker image.
-
-        Need run inside executor.
-        """
-        if self._is_running():
-            return
-
-        # Cleanup
-        self._stop()
-
-        # Create & Run container
-        docker_container = self.sys_docker.run(
-            self.image,
+    @Job(
+        name="docker_observer_run",
+        limit=JobExecutionLimit.GROUP_ONCE,
+        on_condition=DockerJobError,
+    )
+    async def run(self) -> None:
+        """Run Docker image."""
+        await self._run(
             tag=str(self.sys_plugins.observer.version),
             init=False,
             ipv4=self.sys_docker.network.observer,
@@ -45,18 +43,17 @@ class DockerObserver(DockerInterface, CoreSysAttributes):
             hostname=self.name.replace("_", "-"),
             detach=True,
             security_opt=self.security_opt,
-            restart_policy={"Name": "always"},
+            restart_policy={"Name": RestartPolicy.ALWAYS},
             extra_hosts={"supervisor": self.sys_docker.network.supervisor},
             environment={
                 ENV_TIME: self.sys_timezone,
                 ENV_TOKEN: self.sys_plugins.observer.supervisor_token,
                 ENV_NETWORK_MASK: DOCKER_NETWORK_MASK,
             },
-            volumes={"/run/docker.sock": {"bind": "/run/docker.sock", "mode": "ro"}},
+            mounts=[MOUNT_DOCKER],
             ports={"80/tcp": 4357},
+            oom_score_adj=-300,
         )
-
-        self._meta = docker_container.attrs
         _LOGGER.info(
             "Starting Observer %s with version %s - %s",
             self.image,

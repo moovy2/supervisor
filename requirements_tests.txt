@@ -1,14 +1,12 @@
-black==21.12b0
-codecov==2.1.12
-coverage==6.2
-flake8-docstrings==1.6.0
-flake8==4.0.1
-pre-commit==2.16.0
-pydocstyle==6.1.1
-pylint==2.12.2
-pytest-aiohttp==0.3.0
-pytest-asyncio==0.12.0 # NB!: Versions over 0.12.0 breaks pytest-aiohttp (https://github.com/aio-libs/pytest-aiohttp/issues/16)
-pytest-cov==3.0.0
-pytest-timeout==2.0.2
-pytest==6.2.5
-pyupgrade==2.30.0
+coverage==7.4.4
+pre-commit==3.7.0
+pylint==3.1.0
+pytest-aiohttp==1.0.5
+pytest-asyncio==0.23.5
+pytest-cov==5.0.0
+pytest-timeout==2.3.1
+pytest==8.1.1
+ruff==0.4.0
+time-machine==2.14.1
+typing_extensions==4.11.0
+urllib3==2.2.1

@@ -1,12 +1,16 @@
 """Tools file for Supervisor."""
 import asyncio
+from functools import lru_cache
 from ipaddress import IPv4Address
 import logging
 import os
 from pathlib import Path
 import re
 import socket
+from tempfile import TemporaryDirectory
 from typing import Any
+
+from awesomeversion import AwesomeVersion
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -35,20 +39,19 @@ def process_lock(method):
     return wrap_api
 
 
-def check_port(address: IPv4Address, port: int) -> bool:
+async def check_port(address: IPv4Address, port: int) -> bool:
     """Check if port is mapped."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
+    sock.setblocking(False)
     try:
-        result = sock.connect_ex((str(address), port))
-        sock.close()
-
-        # Check if the port is available
-        if result == 0:
-            return True
-    except OSError:
-        pass
-    return False
+        async with asyncio.timeout(0.5):
+            await asyncio.get_running_loop().sock_connect(sock, (str(address), port))
+    except (OSError, TimeoutError):
+        return False
+    finally:
+        if sock is not None:
+            sock.close()
+    return True
 
 
 def check_exception_chain(err: Exception, object_type: Any) -> bool:
@@ -76,31 +79,60 @@ def get_message_from_exception_chain(err: Exception) -> str:
     return get_message_from_exception_chain(err.__context__)
 
 
-async def remove_folder(folder: Path, content_only: bool = False) -> None:
+async def remove_folder(
+    folder: Path,
+    content_only: bool = False,
+    excludes: list[str] | None = None,
+    tmp_dir: Path | None = None,
+) -> None:
     """Remove folder and reset privileged.
 
     Is needed to avoid issue with:
         - CAP_DAC_OVERRIDE
         - CAP_DAC_READ_SEARCH
     """
-    del_folder = f"{folder}" + "/{,.[!.],..?}*" if content_only else f"{folder}"
+    if excludes:
+        if not tmp_dir:
+            raise ValueError("tmp_dir is required if excludes are provided")
+        if not content_only:
+            raise ValueError("Cannot delete the folder if excludes are provided")
+
+        temp = TemporaryDirectory(dir=tmp_dir)
+        temp_path = Path(temp.name)
+        moved_files: list[Path] = []
+        for item in folder.iterdir():
+            if any(item.match(exclude) for exclude in excludes):
+                moved_files.append(item.rename(temp_path / item.name))
+
+    find_args = []
+    if content_only:
+        find_args.extend(["-mindepth", "1"])
     try:
         proc = await asyncio.create_subprocess_exec(
-            "bash",
-            "-c",
-            f"rm -rf {del_folder}",
+            "/usr/bin/find",
+            folder,
+            "-xdev",
+            *find_args,
+            "-delete",
             stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
             env=clean_env(),
         )
 
         _, error_msg = await proc.communicate()
     except OSError as err:
-        error_msg = str(err)
+        _LOGGER.exception("Can't remove folder %s: %s", folder, err)
     else:
         if proc.returncode == 0:
             return
-
-    _LOGGER.error("Can't remove folder %s: %s", folder, error_msg)
+        _LOGGER.error(
+            "Can't remove folder %s: %s", folder, error_msg.decode("utf-8").strip()
+        )
+    finally:
+        if excludes:
+            for item in moved_files:
+                item.rename(folder / item.name)
+            temp.cleanup()
 
 
 def clean_env() -> dict[str, str]:
@@ -110,3 +142,11 @@ def clean_env() -> dict[str, str]:
         if value := os.environ.get(key):
             new_env[key] = value
     return new_env
+
+
+@lru_cache
+def version_is_new_enough(
+    version: AwesomeVersion, want_version: AwesomeVersion
+) -> bool:
+    """Return True if the given version is new enough."""
+    return version >= want_version

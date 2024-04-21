@@ -16,10 +16,10 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 def rating_security(addon: AddonModel) -> int:
-    """Return 1-6 for security rating.
+    """Return 1-8 for security rating.
 
     1 = not secure
-    6 = high secure
+    8 = high secure
     """
     rating = 5
 
@@ -35,17 +35,24 @@ def rating_security(addon: AddonModel) -> int:
     elif addon.access_auth_api:
         rating += 1
 
+    # Signed
+    if addon.signed:
+        rating += 1
+
     # Privileged options
     if (
         any(
             privilege in addon.privileged
             for privilege in (
-                Capabilities.NET_ADMIN,
-                Capabilities.SYS_ADMIN,
-                Capabilities.SYS_RAWIO,
-                Capabilities.SYS_PTRACE,
-                Capabilities.SYS_MODULE,
+                Capabilities.BPF,
                 Capabilities.DAC_READ_SEARCH,
+                Capabilities.NET_ADMIN,
+                Capabilities.NET_RAW,
+                Capabilities.PERFMON,
+                Capabilities.SYS_ADMIN,
+                Capabilities.SYS_MODULE,
+                Capabilities.SYS_PTRACE,
+                Capabilities.SYS_RAWIO,
             )
         )
         or addon.with_kernel_modules
@@ -66,11 +73,15 @@ def rating_security(addon: AddonModel) -> int:
     if addon.host_pid:
         rating += -2
 
+    # UTS host namespace allows to set hostname only with SYS_ADMIN
+    if addon.host_uts and Capabilities.SYS_ADMIN in addon.privileged:
+        rating += -1
+
     # Docker Access & full Access
     if addon.access_docker_api or addon.with_full_access:
         rating = 1
 
-    return max(min(6, rating), 1)
+    return max(min(8, rating), 1)
 
 
 async def remove_data(folder: Path) -> None:

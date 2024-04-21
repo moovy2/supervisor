@@ -20,6 +20,7 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 UNHEALTHY_IMAGES = [
     "watchtower",
     "ouroboros",
+    "portainer",
 ]
 IGNORE_IMAGES = ["sha256"]
 
@@ -45,7 +46,7 @@ class EvaluateContainer(EvaluateBase):
 
     @property
     def on_failure(self) -> str:
-        """Return a string that is printed when self.evaluate is False."""
+        """Return a string that is printed when self.evaluate is True."""
         return f"Found unsupported images: {self._images}"
 
     @property
@@ -63,12 +64,29 @@ class EvaluateContainer(EvaluateBase):
             *(addon.image for addon in self.sys_addons.installed),
         }
 
-    async def evaluate(self) -> None:
+    async def evaluate(self) -> bool:
         """Run evaluation."""
         self.sys_resolution.evaluate.cached_images.clear()
         self._images.clear()
 
-        for image in await self.sys_run_in_executor(self._get_images):
+        try:
+            containers = await self.sys_run_in_executor(self.sys_docker.containers.list)
+        except (DockerException, RequestException) as err:
+            _LOGGER.error("Corrupt docker overlayfs detect: %s", err)
+            self.sys_resolution.create_issue(
+                IssueType.CORRUPT_DOCKER,
+                ContextType.SYSTEM,
+                suggestions=[SuggestionType.EXECUTE_REPAIR],
+            )
+            return False
+
+        images = {
+            image
+            for container in containers
+            if (config := container.attrs.get("Config")) is not None
+            and (image := config.get("Image")) is not None
+        }
+        for image in images:
             self.sys_resolution.evaluate.cached_images.add(image)
 
             image_name = image.partition(":")[0]
@@ -85,22 +103,3 @@ class EvaluateContainer(EvaluateBase):
                     self.sys_resolution.unhealthy = UnhealthyReason.DOCKER
 
         return len(self._images) != 0
-
-    def _get_images(self) -> set[str]:
-        """Return a set of images."""
-        try:
-            return {
-                image
-                for container in self.sys_docker.containers.list()
-                if (config := container.attrs.get("Config")) is not None
-                and (image := config.get("Image")) is not None
-            }
-        except (DockerException, RequestException) as err:
-            _LOGGER.error("Corrupt docker overlayfs detect: %s", err)
-            self.sys_resolution.create_issue(
-                IssueType.CORRUPT_DOCKER,
-                ContextType.SYSTEM,
-                suggestions=[SuggestionType.EXECUTE_REPAIR],
-            )
-
-        return {}

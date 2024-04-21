@@ -1,7 +1,6 @@
 """Validate functions."""
 import ipaddress
 import re
-from typing import Optional, Union
 
 from awesomeversion import AwesomeVersion
 import voluptuous as vol
@@ -9,16 +8,19 @@ import voluptuous as vol
 from .const import (
     ATTR_ADDONS_CUSTOM_LIST,
     ATTR_AUDIO,
+    ATTR_AUTO_UPDATE,
     ATTR_CHANNEL,
     ATTR_CLI,
     ATTR_CONTENT_TRUST,
     ATTR_DEBUG,
     ATTR_DEBUG_BLOCK,
     ATTR_DIAGNOSTICS,
+    ATTR_DISPLAYNAME,
     ATTR_DNS,
     ATTR_FORCE_SECURITY,
     ATTR_HASSOS,
     ATTR_HOMEASSISTANT,
+    ATTR_ID,
     ATTR_IMAGE,
     ATTR_LAST_BOOT,
     ATTR_LOGGING,
@@ -30,6 +32,8 @@ from .const import (
     ATTR_PWNED,
     ATTR_REGISTRIES,
     ATTR_SESSION,
+    ATTR_SESSION_DATA,
+    ATTR_SESSION_DATA_USER,
     ATTR_SUPERVISOR,
     ATTR_TIMEZONE,
     ATTR_USERNAME,
@@ -41,22 +45,25 @@ from .const import (
 )
 from .utils.validate import validate_timezone
 
-RE_REPOSITORY = re.compile(r"^(?P<url>[^#]+)(?:#(?P<branch>[\w\-]+))?$")
+# Move to store.validate when addons_repository config removed
+RE_REPOSITORY = re.compile(r"^(?P<url>[^#]+)(?:#(?P<branch>[\w\-.]+))?$")
 RE_REGISTRY = re.compile(r"^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$")
 
 # pylint: disable=no-value-for-parameter
 # pylint: disable=invalid-name
 network_port = vol.All(vol.Coerce(int), vol.Range(min=1, max=65535))
 wait_boot = vol.All(vol.Coerce(int), vol.Range(min=1, max=60))
-docker_image = vol.Match(r"^([a-zA-Z\-\.:\d{}]+/)*?([\-\w{}]+)/([\-\w{}]+)$")
+docker_image = vol.Match(
+    r"^([a-z0-9][a-z0-9.\-]*(:[0-9]+)?/)*?([a-z0-9{][a-z0-9.\-_{}]*/)*?([a-z0-9{][a-z0-9.\-_{}]*)$"
+)
 uuid_match = vol.Match(r"^[0-9a-f]{32}$")
 sha256 = vol.Match(r"^[0-9a-f]{64}$")
 token = vol.Match(r"^[0-9a-f]{32,256}$")
 
 
 def version_tag(
-    value: Union[str, None, int, float, AwesomeVersion]
-) -> Optional[AwesomeVersion]:
+    value: str | None | int | float | AwesomeVersion,
+) -> AwesomeVersion | None:
     """Validate main version handling."""
     if value is None:
         return None
@@ -84,6 +91,7 @@ def dns_url(url: str) -> str:
 dns_server_list = vol.All(vol.Length(max=8), [dns_url])
 
 
+# Remove with addons_repositories config
 def validate_repository(repository: str) -> str:
     """Validate a valid repository."""
     data = RE_REPOSITORY.match(repository)
@@ -132,6 +140,7 @@ SCHEMA_UPDATER_CONFIG = vol.Schema(
             extra=vol.REMOVE_EXTRA,
         ),
         vol.Optional(ATTR_OTA): vol.Url(),
+        vol.Optional(ATTR_AUTO_UPDATE, default=True): bool,
     },
     extra=vol.REMOVE_EXTRA,
 )
@@ -146,10 +155,7 @@ SCHEMA_SUPERVISOR_CONFIG = vol.Schema(
             ATTR_VERSION, default=AwesomeVersion(SUPERVISOR_VERSION)
         ): version_tag,
         vol.Optional(ATTR_IMAGE): docker_image,
-        vol.Optional(
-            ATTR_ADDONS_CUSTOM_LIST,
-            default=["https://github.com/hassio-addons/repository"],
-        ): repositories,
+        vol.Optional(ATTR_ADDONS_CUSTOM_LIST, default=[]): repositories,
         vol.Optional(ATTR_WAIT_BOOT, default=5): wait_boot,
         vol.Optional(ATTR_LOGGING, default=LogLevel.INFO): vol.Coerce(LogLevel),
         vol.Optional(ATTR_DEBUG, default=False): vol.Boolean(),
@@ -176,17 +182,32 @@ SCHEMA_DOCKER_CONFIG = vol.Schema(
 
 SCHEMA_AUTH_CONFIG = vol.Schema({sha256: sha256})
 
+SCHEMA_SESSION_DATA = vol.Schema(
+    {
+        token: vol.Schema(
+            {
+                vol.Required(ATTR_SESSION_DATA_USER): vol.Schema(
+                    {
+                        vol.Required(ATTR_ID): str,
+                        vol.Required(ATTR_USERNAME, default=None): vol.Maybe(str),
+                        vol.Required(ATTR_DISPLAYNAME, default=None): vol.Maybe(str),
+                    }
+                )
+            }
+        )
+    }
+)
 
 SCHEMA_INGRESS_CONFIG = vol.Schema(
     {
         vol.Required(ATTR_SESSION, default=dict): vol.Schema(
             {token: vol.Coerce(float)}
         ),
+        vol.Required(ATTR_SESSION_DATA, default=dict): SCHEMA_SESSION_DATA,
         vol.Required(ATTR_PORTS, default=dict): vol.Schema({str: network_port}),
     },
     extra=vol.REMOVE_EXTRA,
 )
-
 
 # pylint: disable=no-value-for-parameter
 SCHEMA_SECURITY_CONFIG = vol.Schema(

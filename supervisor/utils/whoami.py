@@ -2,7 +2,6 @@
 
 https://github.com/home-assistant/whoami.home-assistant.io
 """
-import asyncio
 from datetime import datetime
 import logging
 
@@ -13,7 +12,7 @@ from ..exceptions import WhoamiConnectivityError, WhoamiError, WhoamiSSLError
 from .dt import utc_from_timestamp
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
-_API_CALL: str = "whoami.home-assistant.io/v1"
+_API_CALL: str = "services.home-assistant.io/whoami/v1"
 
 
 @attr.s(slots=True, frozen=True)
@@ -51,7 +50,7 @@ async def retrieve_whoami(
             f"Whoami service failed with SSL verification: {err!s}", _LOGGER.warning
         ) from err
 
-    except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+    except (aiohttp.ClientError, TimeoutError) as err:
         raise WhoamiConnectivityError(
             f"Can't fetch Whoami data: {str(err) or 'Timeout'}", _LOGGER.warning
         ) from err

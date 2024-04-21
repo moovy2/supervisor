@@ -1,11 +1,12 @@
 """Home Assistant control object."""
-import asyncio
+from collections.abc import Awaitable
 from contextlib import suppress
+from datetime import timedelta
+import errno
 from ipaddress import IPv4Address
 import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Awaitable, Optional
 
 import aiohttp
 from aiohttp.client_exceptions import ClientError
@@ -25,15 +26,25 @@ from .exceptions import (
     SupervisorJobError,
     SupervisorUpdateError,
 )
-from .jobs.decorator import Job, JobCondition
-from .resolution.const import ContextType, IssueType
+from .jobs.const import JobCondition, JobExecutionLimit
+from .jobs.decorator import Job
+from .resolution.const import ContextType, IssueType, UnhealthyReason
 from .utils.codenotary import calc_checksum
+from .utils.sentry import capture_exception
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
+def _check_connectivity_throttle_period(coresys: CoreSys, *_) -> timedelta:
+    """Throttle period for connectivity check."""
+    if coresys.supervisor.connectivity:
+        return timedelta(minutes=10)
+
+    return timedelta()
+
+
 class Supervisor(CoreSysAttributes):
-    """Home Assistant core object for handle it."""
+    """Supervisor object."""
 
     def __init__(self, coresys: CoreSys):
         """Initialize hass object."""
@@ -42,7 +53,7 @@ class Supervisor(CoreSysAttributes):
         self._connectivity: bool = True
 
     async def load(self) -> None:
-        """Prepare Home Assistant object."""
+        """Prepare Supervisor object."""
         try:
             await self.instance.attach(version=self.version)
         except DockerError:
@@ -104,7 +115,7 @@ class Supervisor(CoreSysAttributes):
 
     async def update_apparmor(self) -> None:
         """Fetch last version and update profile."""
-        url = URL_HASSIO_APPARMOR
+        url = URL_HASSIO_APPARMOR.format(channel=self.sys_updater.channel)
 
         # Fetch
         try:
@@ -118,7 +129,7 @@ class Supervisor(CoreSysAttributes):
                     )
                 data = await request.text()
 
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+        except (aiohttp.ClientError, TimeoutError) as err:
             self.sys_supervisor.connectivity = False
             raise SupervisorAppArmorError(
                 f"Can't fetch AppArmor profile {url}: {str(err) or 'Timeout'}",
@@ -127,7 +138,7 @@ class Supervisor(CoreSysAttributes):
 
         # Validate
         try:
-            await self.sys_security.verify_own_content(checksum=calc_checksum(data))
+            await self.sys_security.verify_own_content(calc_checksum(data))
         except CodeNotaryUntrusted as err:
             raise SupervisorAppArmorError(
                 "Content-Trust is broken for the AppArmor profile fetch!",
@@ -145,6 +156,8 @@ class Supervisor(CoreSysAttributes):
             try:
                 profile_file.write_text(data, encoding="utf-8")
             except OSError as err:
+                if err.errno == errno.EBADMSG:
+                    self.sys_resolution.unhealthy = UnhealthyReason.OSERROR_BAD_MESSAGE
                 raise SupervisorAppArmorError(
                     f"Can't write temporary profile: {err!s}", _LOGGER.error
                 ) from err
@@ -158,8 +171,8 @@ class Supervisor(CoreSysAttributes):
                     "Can't update AppArmor profile!", _LOGGER.error
                 ) from err
 
-    async def update(self, version: Optional[AwesomeVersion] = None) -> None:
-        """Update Home Assistant version."""
+    async def update(self, version: AwesomeVersion | None = None) -> None:
+        """Update Supervisor version."""
         version = version or self.latest_version
 
         if version == self.sys_supervisor.version:
@@ -189,18 +202,22 @@ class Supervisor(CoreSysAttributes):
             self.sys_resolution.create_issue(
                 IssueType.UPDATE_FAILED, ContextType.SUPERVISOR
             )
-            self.sys_capture_exception(err)
+            capture_exception(err)
             raise SupervisorUpdateError(
                 f"Update of Supervisor failed: {err!s}", _LOGGER.error
             ) from err
-        else:
-            self.sys_config.version = version
-            self.sys_config.image = self.sys_updater.image_supervisor
-            self.sys_config.save_data()
+
+        self.sys_config.version = version
+        self.sys_config.image = self.sys_updater.image_supervisor
+        self.sys_config.save_data()
 
         self.sys_create_task(self.sys_core.stop())
 
-    @Job(conditions=[JobCondition.RUNNING], on_condition=SupervisorJobError)
+    @Job(
+        name="supervisor_restart",
+        conditions=[JobCondition.RUNNING],
+        on_condition=SupervisorJobError,
+    )
     async def restart(self) -> None:
         """Restart Supervisor soft."""
         self.sys_core.exit_code = 100
@@ -243,14 +260,19 @@ class Supervisor(CoreSysAttributes):
         except DockerError:
             _LOGGER.error("Repair of Supervisor failed")
 
+    @Job(
+        name="supervisor_check_connectivity",
+        limit=JobExecutionLimit.THROTTLE,
+        throttle_period=_check_connectivity_throttle_period,
+    )
     async def check_connectivity(self):
         """Check the connection."""
         timeout = aiohttp.ClientTimeout(total=10)
         try:
             await self.sys_websession.head(
-                "https://version.home-assistant.io/online.txt", timeout=timeout
+                "https://checkonline.home-assistant.io/online.txt", timeout=timeout
             )
-        except (ClientError, asyncio.TimeoutError):
+        except (ClientError, TimeoutError):
             self.connectivity = False
         else:
             self.connectivity = True

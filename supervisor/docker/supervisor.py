@@ -1,21 +1,23 @@
 """Init file for Supervisor Docker object."""
+from collections.abc import Awaitable
 from ipaddress import IPv4Address
 import logging
 import os
-from typing import Awaitable
 
 from awesomeversion.awesomeversion import AwesomeVersion
 import docker
 import requests
 
-from ..coresys import CoreSysAttributes
 from ..exceptions import DockerError
+from ..jobs.const import JobExecutionLimit
+from ..jobs.decorator import Job
+from .const import PropagationMode
 from .interface import DockerInterface
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
-class DockerSupervisor(DockerInterface, CoreSysAttributes):
+class DockerSupervisor(DockerInterface):
     """Docker Supervisor wrapper for Supervisor."""
 
     @property
@@ -33,13 +35,24 @@ class DockerSupervisor(DockerInterface, CoreSysAttributes):
         """Return True if the container run with Privileged."""
         return self.meta_host.get("Privileged", False)
 
-    def _attach(self, version: AwesomeVersion) -> None:
-        """Attach to running docker container.
+    @property
+    def host_mounts_available(self) -> bool:
+        """Return True if container can see mounts on host within its data directory."""
+        return self._meta and any(
+            mount.get("Propagation") == PropagationMode.SLAVE
+            for mount in self.meta_mounts
+            if mount.get("Destination") == "/data"
+        )
 
-        Need run inside executor.
-        """
+    @Job(name="docker_supervisor_attach", limit=JobExecutionLimit.GROUP_WAIT)
+    async def attach(
+        self, version: AwesomeVersion, *, skip_state_event_if_down: bool = False
+    ) -> None:
+        """Attach to running docker container."""
         try:
-            docker_container = self.sys_docker.containers.get(self.name)
+            docker_container = await self.sys_run_in_executor(
+                self.sys_docker.containers.get, self.name
+            )
         except (docker.errors.DockerException, requests.RequestException) as err:
             raise DockerError() from err
 
@@ -51,17 +64,19 @@ class DockerSupervisor(DockerInterface, CoreSysAttributes):
         )
 
         # If already attach
-        if docker_container in self.sys_docker.network.containers:
+        if docker_container.id in self.sys_docker.network.containers:
             return
 
         # Attach to network
         _LOGGER.info("Connecting Supervisor to hassio-network")
-        self.sys_docker.network.attach_container(
+        await self.sys_run_in_executor(
+            self.sys_docker.network.attach_container,
             docker_container,
             alias=["supervisor"],
             ipv4=self.sys_docker.network.supervisor,
         )
 
+    @Job(name="docker_supervisor_retag", limit=JobExecutionLimit.GROUP_WAIT)
     def retag(self) -> Awaitable[None]:
         """Retag latest image to version."""
         return self.sys_run_in_executor(self._retag)
@@ -81,6 +96,7 @@ class DockerSupervisor(DockerInterface, CoreSysAttributes):
                 f"Can't retag Supervisor version: {err}", _LOGGER.error
             ) from err
 
+    @Job(name="docker_supervisor_update_start_tag", limit=JobExecutionLimit.GROUP_WAIT)
     def update_start_tag(self, image: str, version: AwesomeVersion) -> Awaitable[None]:
         """Update start tag to new version."""
         return self.sys_run_in_executor(self._update_start_tag, image, version)

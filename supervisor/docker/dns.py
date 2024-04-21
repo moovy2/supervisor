@@ -1,8 +1,13 @@
 """DNS docker object."""
 import logging
 
-from ..const import ENV_TIME
+from docker.types import Mount
+
 from ..coresys import CoreSysAttributes
+from ..exceptions import DockerJobError
+from ..jobs.const import JobExecutionLimit
+from ..jobs.decorator import Job
+from .const import ENV_TIME, MOUNT_DBUS, MountType
 from .interface import DockerInterface
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -23,20 +28,14 @@ class DockerDNS(DockerInterface, CoreSysAttributes):
         """Return name of Docker container."""
         return DNS_DOCKER_NAME
 
-    def _run(self) -> None:
-        """Run Docker image.
-
-        Need run inside executor.
-        """
-        if self._is_running():
-            return
-
-        # Cleanup
-        self._stop()
-
-        # Create & Run container
-        docker_container = self.sys_docker.run(
-            self.image,
+    @Job(
+        name="docker_dns_run",
+        limit=JobExecutionLimit.GROUP_ONCE,
+        on_condition=DockerJobError,
+    )
+    async def run(self) -> None:
+        """Run Docker image."""
+        await self._run(
             tag=str(self.sys_plugins.dns.version),
             init=False,
             dns=False,
@@ -46,12 +45,17 @@ class DockerDNS(DockerInterface, CoreSysAttributes):
             detach=True,
             security_opt=self.security_opt,
             environment={ENV_TIME: self.sys_timezone},
-            volumes={
-                str(self.sys_config.path_extern_dns): {"bind": "/config", "mode": "rw"}
-            },
+            mounts=[
+                Mount(
+                    type=MountType.BIND,
+                    source=self.sys_config.path_extern_dns.as_posix(),
+                    target="/config",
+                    read_only=False,
+                ),
+                MOUNT_DBUS,
+            ],
+            oom_score_adj=-300,
         )
-
-        self._meta = docker_container.attrs
         _LOGGER.info(
             "Starting DNS %s with version %s - %s",
             self.image,

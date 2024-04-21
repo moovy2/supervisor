@@ -7,8 +7,6 @@ import uuid
 
 import voluptuous as vol
 
-from supervisor.addons.const import AddonBackupMode
-
 from ..const import (
     ARCH_ALL,
     ATTR_ACCESS_TOKEN,
@@ -43,6 +41,7 @@ from ..const import (
     ATTR_HOST_IPC,
     ATTR_HOST_NETWORK,
     ATTR_HOST_PID,
+    ATTR_HOST_UTS,
     ATTR_IMAGE,
     ATTR_INGRESS,
     ATTR_INGRESS_ENTRY,
@@ -82,6 +81,7 @@ from ..const import (
     ATTR_TIMEOUT,
     ATTR_TMPFS,
     ATTR_TRANSLATIONS,
+    ATTR_TYPE,
     ATTR_UART,
     ATTR_UDEV,
     ATTR_URL,
@@ -99,7 +99,6 @@ from ..const import (
     AddonStartup,
     AddonState,
 )
-from ..discovery.validate import valid_discovery_service
 from ..docker.const import Capabilities
 from ..validate import (
     docker_image,
@@ -110,12 +109,23 @@ from ..validate import (
     uuid_match,
     version_tag,
 )
-from .const import ATTR_BACKUP
+from .const import (
+    ATTR_BACKUP,
+    ATTR_BREAKING_VERSIONS,
+    ATTR_CODENOTARY,
+    ATTR_PATH,
+    ATTR_READ_ONLY,
+    RE_SLUG,
+    AddonBackupMode,
+    MappingType,
+)
 from .options import RE_SCHEMA_ELEMENT
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-RE_VOLUME = re.compile(r"^(config|ssl|addons|backup|share|media)(?::(rw|ro))?$")
+RE_VOLUME = re.compile(
+    r"^(data|config|ssl|addons|backup|share|media|homeassistant_config|all_addon_configs|addon_config)(?::(rw|ro))?$"
+)
 RE_SERVICE = re.compile(r"^(?P<service>mqtt|mysql):(?P<rights>provide|want|need)$")
 
 
@@ -131,6 +141,7 @@ RE_MACHINE = re.compile(
     r"|generic-x86-64"
     r"|odroid-c2"
     r"|odroid-c4"
+    r"|odroid-m1"
     r"|odroid-n2"
     r"|odroid-xu"
     r"|qemuarm-64"
@@ -143,9 +154,14 @@ RE_MACHINE = re.compile(
     r"|raspberrypi3"
     r"|raspberrypi4-64"
     r"|raspberrypi4"
+    r"|raspberrypi5-64"
+    r"|yellow"
+    r"|green"
     r"|tinker"
     r")$"
 )
+
+RE_SLUG_FIELD = re.compile(r"^" + RE_SLUG + r"$")
 
 
 def _warn_addon_config(config: dict[str, Any]):
@@ -194,9 +210,9 @@ def _migrate_addon_config(protocol=False):
                     name,
                 )
             if value == "before":
-                config[ATTR_STARTUP] = AddonStartup.SERVICES.value
+                config[ATTR_STARTUP] = AddonStartup.SERVICES
             elif value == "after":
-                config[ATTR_STARTUP] = AddonStartup.APPLICATION.value
+                config[ATTR_STARTUP] = AddonStartup.APPLICATION
 
         # UART 2021-01-20
         if "auto_uart" in config:
@@ -242,6 +258,48 @@ def _migrate_addon_config(protocol=False):
                     name,
                 )
 
+        # 2023-11 "map" entries can also be dict to allow path configuration
+        volumes = []
+        for entry in config.get(ATTR_MAP, []):
+            if isinstance(entry, dict):
+                volumes.append(entry)
+            if isinstance(entry, str):
+                result = RE_VOLUME.match(entry)
+                if not result:
+                    continue
+                volumes.append(
+                    {
+                        ATTR_TYPE: result.group(1),
+                        ATTR_READ_ONLY: result.group(2) != "rw",
+                    }
+                )
+
+        if volumes:
+            config[ATTR_MAP] = volumes
+
+        # 2023-10 "config" became "homeassistant" so /config can be used for addon's public config
+        if any(volume[ATTR_TYPE] == MappingType.CONFIG for volume in volumes):
+            if any(
+                volume
+                and volume[ATTR_TYPE]
+                in {MappingType.ADDON_CONFIG, MappingType.HOMEASSISTANT_CONFIG}
+                for volume in volumes
+            ):
+                _LOGGER.warning(
+                    "Add-on config using incompatible map options, '%s' and '%s' are ignored if '%s' is included. Please report this to the maintainer of %s",
+                    MappingType.ADDON_CONFIG,
+                    MappingType.HOMEASSISTANT_CONFIG,
+                    MappingType.CONFIG,
+                    name,
+                )
+            else:
+                _LOGGER.debug(
+                    "Add-on config using deprecated map option '%s' instead of '%s'. Please report this to the maintainer of %s",
+                    MappingType.CONFIG,
+                    MappingType.HOMEASSISTANT_CONFIG,
+                    name,
+                )
+
         return config
 
     return _migrate
@@ -252,7 +310,7 @@ _SCHEMA_ADDON_CONFIG = vol.Schema(
     {
         vol.Required(ATTR_NAME): str,
         vol.Required(ATTR_VERSION): version_tag,
-        vol.Required(ATTR_SLUG): str,
+        vol.Required(ATTR_SLUG): vol.Match(RE_SLUG_FIELD),
         vol.Required(ATTR_DESCRIPTON): str,
         vol.Required(ATTR_ARCH): [vol.In(ARCH_ALL)],
         vol.Optional(ATTR_MACHINE): vol.All([vol.Match(RE_MACHINE)], vol.Unique()),
@@ -285,11 +343,20 @@ _SCHEMA_ADDON_CONFIG = vol.Schema(
         vol.Optional(ATTR_HOST_NETWORK, default=False): vol.Boolean(),
         vol.Optional(ATTR_HOST_PID, default=False): vol.Boolean(),
         vol.Optional(ATTR_HOST_IPC, default=False): vol.Boolean(),
+        vol.Optional(ATTR_HOST_UTS, default=False): vol.Boolean(),
         vol.Optional(ATTR_HOST_DBUS, default=False): vol.Boolean(),
         vol.Optional(ATTR_DEVICES): [str],
         vol.Optional(ATTR_UDEV, default=False): vol.Boolean(),
         vol.Optional(ATTR_TMPFS, default=False): vol.Boolean(),
-        vol.Optional(ATTR_MAP, default=list): [vol.Match(RE_VOLUME)],
+        vol.Optional(ATTR_MAP, default=list): [
+            vol.Schema(
+                {
+                    vol.Required(ATTR_TYPE): vol.Coerce(MappingType),
+                    vol.Optional(ATTR_READ_ONLY, default=True): bool,
+                    vol.Optional(ATTR_PATH): str,
+                }
+            )
+        ],
         vol.Optional(ATTR_ENVIRONMENT): {vol.Match(r"\w*"): str},
         vol.Optional(ATTR_PRIVILEGED): [vol.Coerce(Capabilities)],
         vol.Optional(ATTR_APPARMOR, default=True): vol.Boolean(),
@@ -310,13 +377,14 @@ _SCHEMA_ADDON_CONFIG = vol.Schema(
         vol.Optional(ATTR_DOCKER_API, default=False): vol.Boolean(),
         vol.Optional(ATTR_AUTH_API, default=False): vol.Boolean(),
         vol.Optional(ATTR_SERVICES): [vol.Match(RE_SERVICE)],
-        vol.Optional(ATTR_DISCOVERY): [valid_discovery_service],
+        vol.Optional(ATTR_DISCOVERY): [str],
         vol.Optional(ATTR_BACKUP_EXCLUDE): [str],
         vol.Optional(ATTR_BACKUP_PRE): str,
         vol.Optional(ATTR_BACKUP_POST): str,
         vol.Optional(ATTR_BACKUP, default=AddonBackupMode.HOT): vol.Coerce(
             AddonBackupMode
         ),
+        vol.Optional(ATTR_CODENOTARY): vol.Email(),
         vol.Optional(ATTR_OPTIONS, default={}): dict,
         vol.Optional(ATTR_SCHEMA, default={}): vol.Any(
             vol.Schema(
@@ -340,6 +408,7 @@ _SCHEMA_ADDON_CONFIG = vol.Schema(
             vol.Coerce(int), vol.Range(min=10, max=300)
         ),
         vol.Optional(ATTR_JOURNALD, default=False): vol.Boolean(),
+        vol.Optional(ATTR_BREAKING_VERSIONS, default=list): [version_tag],
     },
     extra=vol.REMOVE_EXTRA,
 )
@@ -352,8 +421,9 @@ SCHEMA_ADDON_CONFIG = vol.All(
 # pylint: disable=no-value-for-parameter
 SCHEMA_BUILD_CONFIG = vol.Schema(
     {
-        vol.Optional(ATTR_BUILD_FROM, default=dict): vol.Schema(
-            {vol.In(ARCH_ALL): vol.Match(RE_DOCKER_IMAGE_BUILD)}
+        vol.Optional(ATTR_BUILD_FROM, default=dict): vol.Any(
+            vol.Match(RE_DOCKER_IMAGE_BUILD),
+            vol.Schema({vol.In(ARCH_ALL): vol.Match(RE_DOCKER_IMAGE_BUILD)}),
         ),
         vol.Optional(ATTR_SQUASH, default=False): vol.Boolean(),
         vol.Optional(ATTR_ARGS, default=dict): vol.Schema({str: str}),

@@ -2,12 +2,18 @@
 import asyncio
 import hashlib
 import logging
-from typing import Optional
+from typing import Any
 
 from .addons.addon import Addon
-from .const import ATTR_ADDON, ATTR_PASSWORD, ATTR_USERNAME, FILE_HASSIO_AUTH
+from .const import ATTR_ADDON, ATTR_PASSWORD, ATTR_TYPE, ATTR_USERNAME, FILE_HASSIO_AUTH
 from .coresys import CoreSys, CoreSysAttributes
-from .exceptions import AuthError, AuthPasswordResetError, HomeAssistantAPIError
+from .exceptions import (
+    AuthError,
+    AuthListUsersError,
+    AuthPasswordResetError,
+    HomeAssistantAPIError,
+    HomeAssistantWSError,
+)
 from .utils.common import FileConfiguration
 from .validate import SCHEMA_AUTH_CONFIG
 
@@ -24,7 +30,7 @@ class Auth(FileConfiguration, CoreSysAttributes):
 
         self._running: dict[str, asyncio.Task] = {}
 
-    def _check_cache(self, username: str, password: str) -> Optional[bool]:
+    def _check_cache(self, username: str, password: str) -> bool | None:
         """Check password in cache."""
         username_h = self._rehash(username)
         password_h = self._rehash(password, username)
@@ -100,7 +106,6 @@ class Auth(FileConfiguration, CoreSysAttributes):
                     ATTR_ADDON: addon.slug,
                 },
             ) as req:
-
                 if req.status == 200:
                     _LOGGER.info("Successful login for '%s'", username)
                     self._update_cache(username, password)
@@ -133,6 +138,17 @@ class Auth(FileConfiguration, CoreSysAttributes):
             _LOGGER.error("Can't request password reset on Home Assistant!")
 
         raise AuthPasswordResetError()
+
+    async def list_users(self) -> list[dict[str, Any]]:
+        """List users on the Home Assistant instance."""
+        try:
+            return await self.sys_homeassistant.websocket.async_send_command(
+                {ATTR_TYPE: "config/auth/list"}
+            )
+        except HomeAssistantWSError:
+            _LOGGER.error("Can't request listing users on Home Assistant!")
+
+        raise AuthListUsersError()
 
     @staticmethod
     def _rehash(value: str, salt2: str = "") -> str:

@@ -1,9 +1,11 @@
 """HA Cli docker object."""
 import logging
 
-from ..const import ENV_TIME
 from ..coresys import CoreSysAttributes
-from .const import Capabilities
+from ..exceptions import DockerJobError
+from ..jobs.const import JobExecutionLimit
+from ..jobs.decorator import Job
+from .const import ENV_TIME, Capabilities
 from .interface import DockerInterface
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -25,24 +27,18 @@ class DockerMulticast(DockerInterface, CoreSysAttributes):
         return MULTICAST_DOCKER_NAME
 
     @property
-    def capabilities(self) -> list[str]:
+    def capabilities(self) -> list[Capabilities]:
         """Generate needed capabilities."""
-        return [Capabilities.NET_ADMIN.value]
+        return [Capabilities.NET_ADMIN]
 
-    def _run(self) -> None:
-        """Run Docker image.
-
-        Need run inside executor.
-        """
-        if self._is_running():
-            return
-
-        # Cleanup
-        self._stop()
-
-        # Create & Run container
-        docker_container = self.sys_docker.run(
-            self.image,
+    @Job(
+        name="docker_multicast_run",
+        limit=JobExecutionLimit.GROUP_ONCE,
+        on_condition=DockerJobError,
+    )
+    async def run(self) -> None:
+        """Run Docker image."""
+        await self._run(
             tag=str(self.sys_plugins.multicast.version),
             init=False,
             name=self.name,
@@ -54,8 +50,6 @@ class DockerMulticast(DockerInterface, CoreSysAttributes):
             extra_hosts={"supervisor": self.sys_docker.network.supervisor},
             environment={ENV_TIME: self.sys_timezone},
         )
-
-        self._meta = docker_container.attrs
         _LOGGER.info(
             "Starting Multicast %s with version %s - Host", self.image, self.version
         )

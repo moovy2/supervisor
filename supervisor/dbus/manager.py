@@ -1,16 +1,23 @@
 """D-Bus interface objects."""
+import asyncio
 import logging
+
+from dbus_fast import BusType
+from dbus_fast.aio.message_bus import MessageBus
 
 from ..const import SOCKET_DBUS
 from ..coresys import CoreSys, CoreSysAttributes
+from ..exceptions import DBusFatalError
 from .agent import OSAgent
 from .hostname import Hostname
 from .interface import DBusInterface
 from .logind import Logind
 from .network import NetworkManager
 from .rauc import Rauc
+from .resolved import Resolved
 from .systemd import Systemd
 from .timedate import TimeDate
+from .udisks2 import UDisks2
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -29,6 +36,9 @@ class DBusManager(CoreSysAttributes):
         self._network: NetworkManager = NetworkManager()
         self._agent: OSAgent = OSAgent()
         self._timedate: TimeDate = TimeDate()
+        self._resolved: Resolved = Resolved()
+        self._udisks2: UDisks2 = UDisks2()
+        self._bus: MessageBus | None = None
 
     @property
     def systemd(self) -> Systemd:
@@ -65,6 +75,36 @@ class DBusManager(CoreSysAttributes):
         """Return the timedate interface."""
         return self._timedate
 
+    @property
+    def resolved(self) -> Resolved:
+        """Return the resolved interface."""
+        return self._resolved
+
+    @property
+    def udisks2(self) -> UDisks2:
+        """Return the udisks2 interface."""
+        return self._udisks2
+
+    @property
+    def bus(self) -> MessageBus | None:
+        """Return the message bus."""
+        return self._bus
+
+    @property
+    def all(self) -> list[DBusInterface]:
+        """Return all managed dbus interfaces."""
+        return [
+            self.agent,
+            self.hostname,
+            self.logind,
+            self.network,
+            self.rauc,
+            self.resolved,
+            self.systemd,
+            self.timedate,
+            self.udisks2,
+        ]
+
     async def load(self) -> None:
         """Connect interfaces to D-Bus."""
         if not SOCKET_DBUS.exists():
@@ -73,20 +113,37 @@ class DBusManager(CoreSysAttributes):
             )
             return
 
-        dbus_loads: list[DBusInterface] = [
-            self.agent,
-            self.systemd,
-            self.logind,
-            self.hostname,
-            self.timedate,
-            self.network,
-            self.rauc,
-        ]
-        for dbus in dbus_loads:
-            _LOGGER.info("Load dbus interface %s", dbus.name)
-            try:
-                await dbus.connect()
-            except Exception as err:  # pylint: disable=broad-except
-                _LOGGER.warning("Can't load dbus interface %s: %s", dbus.name, err)
+        try:
+            self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        except Exception as err:
+            raise DBusFatalError(
+                "Cannot connect to system D-Bus. Disabled any kind of host control!"
+            ) from err
+
+        _LOGGER.info("Connected to system D-Bus.")
+
+        errors = await asyncio.gather(
+            *[dbus.connect(self.bus) for dbus in self.all], return_exceptions=True
+        )
+
+        for err in errors:
+            if err:
+                _LOGGER.warning(
+                    "Can't load dbus interface %s: %s",
+                    self.all[errors.index(err)].name,
+                    err,
+                )
 
         self.sys_host.supported_features.cache_clear()
+
+    async def unload(self) -> None:
+        """Close connection to D-Bus."""
+        if not self.bus:
+            _LOGGER.warning("No D-Bus connection to close.")
+            return
+
+        for dbus in self.all:
+            dbus.shutdown()
+
+        self.bus.disconnect()
+        _LOGGER.info("Closed conection to system D-Bus.")

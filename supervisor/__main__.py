@@ -5,7 +5,15 @@ import logging
 from pathlib import Path
 import sys
 
-from supervisor import bootstrap
+import zlib_fast
+
+# Enable fast zlib before importing supervisor
+zlib_fast.enable()
+
+from supervisor import bootstrap  # pylint: disable=wrong-import-position # noqa: E402
+from supervisor.utils.logging import (  # pylint: disable=wrong-import-position  # noqa: E402
+    activate_log_queue_handler,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -28,7 +36,8 @@ if __name__ == "__main__":
     bootstrap.initialize_logging()
 
     # Init async event loop
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     # Check if all information are available to setup Supervisor
     bootstrap.check_environment()
@@ -36,6 +45,8 @@ if __name__ == "__main__":
     # init executor pool
     executor = ThreadPoolExecutor(thread_name_prefix="SyncWorker")
     loop.set_default_executor(executor)
+
+    activate_log_queue_handler()
 
     _LOGGER.info("Initializing Supervisor setup")
     coresys = loop.run_until_complete(bootstrap.initialize_coresys())

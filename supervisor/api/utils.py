@@ -1,6 +1,6 @@
 """Init file for Supervisor util for RESTful API."""
 import json
-from typing import Any, Optional
+from typing import Any
 
 from aiohttp import web
 from aiohttp.hdrs import AUTHORIZATION
@@ -10,10 +10,10 @@ import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
 from ..const import (
-    CONTENT_TYPE_BINARY,
     HEADER_TOKEN,
     HEADER_TOKEN_OLD,
     JSON_DATA,
+    JSON_JOB_ID,
     JSON_MESSAGE,
     JSON_RESULT,
     REQUEST_FROM,
@@ -23,24 +23,22 @@ from ..const import (
 from ..coresys import CoreSys
 from ..exceptions import APIError, APIForbidden, DockerAPIError, HassioError
 from ..utils import check_exception_chain, get_message_from_exception_chain
-from ..utils.json import JSONEncoder
+from ..utils.json import json_dumps, json_loads as json_loads_util
 from ..utils.log_format import format_message
+from . import const
 
 
-def excract_supervisor_token(request: web.Request) -> Optional[str]:
+def excract_supervisor_token(request: web.Request) -> str | None:
     """Extract Supervisor token from request."""
-    supervisor_token = request.headers.get(HEADER_TOKEN)
-    if supervisor_token:
+    if supervisor_token := request.headers.get(HEADER_TOKEN):
         return supervisor_token
 
-    # Remove with old Supervisor fallback
-    supervisor_token = request.headers.get(HEADER_TOKEN_OLD)
-    if supervisor_token:
+    # Old Supervisor fallback
+    if supervisor_token := request.headers.get(HEADER_TOKEN_OLD):
         return supervisor_token
 
     # API access only
-    supervisor_token = request.headers.get(AUTHORIZATION)
-    if supervisor_token:
+    if supervisor_token := request.headers.get(AUTHORIZATION):
         return supervisor_token.split(" ")[-1]
 
     return None
@@ -51,7 +49,7 @@ def json_loads(data: Any) -> dict[str, Any]:
     if not data:
         return {}
     try:
-        return json.loads(data)
+        return json_loads_util(data)
     except json.JSONDecodeError as err:
         raise APIError("Invalid json") from err
 
@@ -69,6 +67,8 @@ def api_process(method):
         if isinstance(answer, (dict, list)):
             return api_return_ok(data=answer)
         if isinstance(answer, web.Response):
+            return answer
+        if isinstance(answer, web.StreamResponse):
             return answer
         elif isinstance(answer, bool) and not answer:
             return api_return_error()
@@ -91,7 +91,7 @@ def require_home_assistant(method):
     return wrap_api
 
 
-def api_process_raw(content):
+def api_process_raw(content, *, error_type=None):
     """Wrap content_type into function."""
 
     def wrap_method(method):
@@ -101,15 +101,15 @@ def api_process_raw(content):
             """Return api information."""
             try:
                 msg_data = await method(api, *args, **kwargs)
-                msg_type = content
-            except (APIError, APIForbidden) as err:
-                msg_data = str(err).encode()
-                msg_type = CONTENT_TYPE_BINARY
-            except HassioError:
-                msg_data = b""
-                msg_type = CONTENT_TYPE_BINARY
+            except HassioError as err:
+                return api_return_error(
+                    err, error_type=error_type or const.CONTENT_TYPE_BINARY
+                )
 
-            return web.Response(body=msg_data, content_type=msg_type)
+            if isinstance(msg_data, (web.Response, web.StreamResponse)):
+                return msg_data
+
+            return web.Response(body=msg_data, content_type=content)
 
         return wrap_api
 
@@ -117,34 +117,54 @@ def api_process_raw(content):
 
 
 def api_return_error(
-    error: Optional[Exception] = None, message: Optional[str] = None
+    error: Exception | None = None,
+    message: str | None = None,
+    error_type: str | None = None,
 ) -> web.Response:
     """Return an API error message."""
     if error and not message:
         message = get_message_from_exception_chain(error)
         if check_exception_chain(error, DockerAPIError):
             message = format_message(message)
+    if not message:
+        message = "Unknown error, see supervisor"
+
+    status = 400
+    if is_api_error := isinstance(error, APIError):
+        status = error.status
+
+    match error_type:
+        case const.CONTENT_TYPE_TEXT:
+            return web.Response(body=message, content_type=error_type, status=status)
+        case const.CONTENT_TYPE_BINARY:
+            return web.Response(
+                body=message.encode(), content_type=error_type, status=status
+            )
+        case _:
+            result = {
+                JSON_RESULT: RESULT_ERROR,
+                JSON_MESSAGE: message,
+            }
+            if is_api_error and error.job_id:
+                result[JSON_JOB_ID] = error.job_id
 
     return web.json_response(
-        {
-            JSON_RESULT: RESULT_ERROR,
-            JSON_MESSAGE: message or "Unknown error, see supervisor",
-        },
-        status=400,
-        dumps=lambda x: json.dumps(x, cls=JSONEncoder),
+        result,
+        status=status,
+        dumps=json_dumps,
     )
 
 
-def api_return_ok(data: Optional[dict[str, Any]] = None) -> web.Response:
+def api_return_ok(data: dict[str, Any] | None = None) -> web.Response:
     """Return an API ok answer."""
     return web.json_response(
         {JSON_RESULT: RESULT_OK, JSON_DATA: data or {}},
-        dumps=lambda x: json.dumps(x, cls=JSONEncoder),
+        dumps=json_dumps,
     )
 
 
 async def api_validate(
-    schema: vol.Schema, request: web.Request, origin: Optional[list[str]] = None
+    schema: vol.Schema, request: web.Request, origin: list[str] | None = None
 ) -> dict[str, Any]:
     """Validate request data with schema."""
     data: dict[str, Any] = await request.json(loads=json_loads)

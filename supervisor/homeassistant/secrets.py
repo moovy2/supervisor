@@ -2,7 +2,6 @@
 from datetime import timedelta
 import logging
 from pathlib import Path
-from typing import Optional, Union
 
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import YamlFileError
@@ -19,14 +18,14 @@ class HomeAssistantSecrets(CoreSysAttributes):
     def __init__(self, coresys: CoreSys):
         """Initialize secret manager."""
         self.coresys: CoreSys = coresys
-        self.secrets: dict[str, Union[bool, float, int, str]] = {}
+        self.secrets: dict[str, bool | float | int | str] = {}
 
     @property
     def path_secrets(self) -> Path:
         """Return path to secret file."""
         return Path(self.sys_config.path_homeassistant, "secrets.yaml")
 
-    def get(self, secret: str) -> Optional[Union[bool, float, int, str]]:
+    def get(self, secret: str) -> bool | float | int | str | None:
         """Get secret from store."""
         _LOGGER.info("Request secret %s", secret)
         return self.secrets.get(secret)
@@ -41,7 +40,12 @@ class HomeAssistantSecrets(CoreSysAttributes):
         """Reload secrets."""
         await self._read_secrets()
 
-    @Job(limit=JobExecutionLimit.THROTTLE_WAIT, throttle_period=timedelta(seconds=60))
+    @Job(
+        name="home_assistant_secrets_read",
+        limit=JobExecutionLimit.THROTTLE_WAIT,
+        throttle_period=timedelta(seconds=60),
+        internal=True,
+    )
     async def _read_secrets(self):
         """Read secrets.yaml into memory."""
         if not self.path_secrets.exists():

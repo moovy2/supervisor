@@ -1,41 +1,99 @@
 """Interface to Systemd over D-Bus."""
-import logging
-from typing import Any
 
-from ..exceptions import DBusError, DBusInterfaceError
-from ..utils.dbus import DBus
+from functools import wraps
+import logging
+
+from dbus_fast import Variant
+from dbus_fast.aio.message_bus import MessageBus
+
+from ..exceptions import (
+    DBusError,
+    DBusFatalError,
+    DBusInterfaceError,
+    DBusServiceUnkownError,
+    DBusSystemdNoSuchUnit,
+)
+from ..utils.dbus import DBusSignalWrapper
 from .const import (
     DBUS_ATTR_FINISH_TIMESTAMP,
     DBUS_ATTR_FIRMWARE_TIMESTAMP_MONOTONIC,
     DBUS_ATTR_KERNEL_TIMESTAMP_MONOTONIC,
     DBUS_ATTR_LOADER_TIMESTAMP_MONOTONIC,
     DBUS_ATTR_USERSPACE_TIMESTAMP_MONOTONIC,
+    DBUS_ATTR_VIRTUALIZATION,
+    DBUS_ERR_SYSTEMD_NO_SUCH_UNIT,
     DBUS_IFACE_SYSTEMD_MANAGER,
     DBUS_NAME_SYSTEMD,
     DBUS_OBJECT_SYSTEMD,
+    DBUS_SIGNAL_PROPERTIES_CHANGED,
+    StartUnitMode,
+    StopUnitMode,
+    UnitActiveState,
 )
-from .interface import DBusInterface, dbus_property
+from .interface import DBusInterface, DBusInterfaceProxy, dbus_property
 from .utils import dbus_connected
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
-class Systemd(DBusInterface):
-    """Systemd function handler."""
+def systemd_errors(func):
+    """Wrap systemd dbus methods to handle its specific error types."""
 
-    name = DBUS_NAME_SYSTEMD
-
-    def __init__(self) -> None:
-        """Initialize Properties."""
-        self.properties: dict[str, Any] = {}
-
-    async def connect(self):
-        """Connect to D-Bus."""
+    @wraps(func)
+    async def wrapper(*args, **kwds):
         try:
-            self.dbus = await DBus.connect(DBUS_NAME_SYSTEMD, DBUS_OBJECT_SYSTEMD)
+            return await func(*args, **kwds)
+        except DBusFatalError as err:
+            if err.type == DBUS_ERR_SYSTEMD_NO_SUCH_UNIT:
+                raise DBusSystemdNoSuchUnit(str(err)) from None
+            raise err
+
+    return wrapper
+
+
+class SystemdUnit(DBusInterface):
+    """Systemd service unit."""
+
+    name: str = DBUS_NAME_SYSTEMD
+    bus_name: str = DBUS_NAME_SYSTEMD
+
+    def __init__(self, object_path: str) -> None:
+        """Initialize object."""
+        super().__init__()
+        self.object_path = object_path
+
+    @dbus_connected
+    async def get_active_state(self) -> UnitActiveState:
+        """Get active state of the unit."""
+        return await self.dbus.Unit.get_active_state()
+
+    @dbus_connected
+    def properties_changed(self) -> DBusSignalWrapper:
+        """Return signal wrapper for properties changed."""
+        return self.dbus.signal(DBUS_SIGNAL_PROPERTIES_CHANGED)
+
+
+class Systemd(DBusInterfaceProxy):
+    """Systemd function handler.
+
+    https://www.freedesktop.org/software/systemd/man/org.freedesktop.systemd1.html
+    """
+
+    name: str = DBUS_NAME_SYSTEMD
+    bus_name: str = DBUS_NAME_SYSTEMD
+    object_path: str = DBUS_OBJECT_SYSTEMD
+    # NFailedUnits is the only property that emits a change signal and we don't use it
+    sync_properties: bool = False
+    properties_interface: str = DBUS_IFACE_SYSTEMD_MANAGER
+
+    async def connect(self, bus: MessageBus):
+        """Connect to D-Bus."""
+        _LOGGER.info("Load dbus interface %s", self.name)
+        try:
+            await super().connect(bus)
         except DBusError:
             _LOGGER.warning("Can't connect to systemd")
-        except DBusInterfaceError:
+        except (DBusServiceUnkownError, DBusInterfaceError):
             _LOGGER.warning(
                 "No systemd support on the host. Host control has been disabled."
             )
@@ -57,63 +115,73 @@ class Systemd(DBusInterface):
         """Return the boot timestamp."""
         return self.properties[DBUS_ATTR_FINISH_TIMESTAMP]
 
-    @dbus_connected
-    def reboot(self):
-        """Reboot host computer.
-
-        Return a coroutine.
-        """
-        return self.dbus.Manager.Reboot()
+    @property
+    @dbus_property
+    def virtualization(self) -> str:
+        """Return virtualization hypervisor being used."""
+        return self.properties[DBUS_ATTR_VIRTUALIZATION]
 
     @dbus_connected
-    def power_off(self):
-        """Power off host computer.
-
-        Return a coroutine.
-        """
-        return self.dbus.Manager.PowerOff()
+    async def reboot(self) -> None:
+        """Reboot host computer."""
+        await self.dbus.Manager.call_reboot()
 
     @dbus_connected
-    def start_unit(self, unit, mode):
-        """Start a systemd service unit.
-
-        Return a coroutine.
-        """
-        return self.dbus.Manager.StartUnit(unit, mode)
+    async def power_off(self) -> None:
+        """Power off host computer."""
+        await self.dbus.Manager.call_power_off()
 
     @dbus_connected
-    def stop_unit(self, unit, mode):
-        """Stop a systemd service unit.
-
-        Return a coroutine.
-        """
-        return self.dbus.Manager.StopUnit(unit, mode)
+    @systemd_errors
+    async def start_unit(self, unit: str, mode: StartUnitMode) -> str:
+        """Start a systemd service unit. Returns object path of job."""
+        return await self.dbus.Manager.call_start_unit(unit, mode)
 
     @dbus_connected
-    def reload_unit(self, unit, mode):
-        """Reload a systemd service unit.
-
-        Return a coroutine.
-        """
-        return self.dbus.Manager.ReloadOrRestartUnit(unit, mode)
+    @systemd_errors
+    async def stop_unit(self, unit: str, mode: StopUnitMode) -> str:
+        """Stop a systemd service unit. Returns object path of job."""
+        return await self.dbus.Manager.call_stop_unit(unit, mode)
 
     @dbus_connected
-    def restart_unit(self, unit, mode):
-        """Restart a systemd service unit.
-
-        Return a coroutine.
-        """
-        return self.dbus.Manager.RestartUnit(unit, mode)
+    @systemd_errors
+    async def reload_unit(self, unit: str, mode: StartUnitMode) -> str:
+        """Reload a systemd service unit. Returns object path of job."""
+        return await self.dbus.Manager.call_reload_or_restart_unit(unit, mode)
 
     @dbus_connected
-    def list_units(self):
-        """Return a list of available systemd services.
-
-        Return a coroutine.
-        """
-        return self.dbus.Manager.ListUnits()
+    @systemd_errors
+    async def restart_unit(self, unit: str, mode: StartUnitMode) -> str:
+        """Restart a systemd service unit. Returns object path of job."""
+        return await self.dbus.Manager.call_restart_unit(unit, mode)
 
     @dbus_connected
-    async def update(self):
-        """Update Properties."""
-        self.properties = await self.dbus.get_properties(DBUS_IFACE_SYSTEMD_MANAGER)
+    async def list_units(
+        self,
+    ) -> list[tuple[str, str, str, str, str, str, str, int, str, str]]:
+        """Return a list of available systemd services."""
+        return await self.dbus.Manager.call_list_units()
+
+    @dbus_connected
+    async def start_transient_unit(
+        self, unit: str, mode: StartUnitMode, properties: list[tuple[str, Variant]]
+    ) -> str:
+        """Start a transient unit which is released when stopped or on reboot. Returns object path of job."""
+        return await self.dbus.Manager.call_start_transient_unit(
+            unit, mode, properties, []
+        )
+
+    @dbus_connected
+    @systemd_errors
+    async def reset_failed_unit(self, unit: str) -> None:
+        """Reset the failed state of a unit."""
+        await self.dbus.Manager.call_reset_failed_unit(unit)
+
+    @dbus_connected
+    @systemd_errors
+    async def get_unit(self, unit: str) -> SystemdUnit:
+        """Return systemd unit for unit name."""
+        obj_path = await self.dbus.Manager.call_get_unit(unit)
+        unit = SystemdUnit(obj_path)
+        await unit.connect(self.dbus.bus)
+        return unit

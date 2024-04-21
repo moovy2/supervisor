@@ -1,8 +1,9 @@
 """Bus event system."""
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 import logging
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import attr
 
@@ -10,6 +11,14 @@ from .const import BusEvent
 from .coresys import CoreSys, CoreSysAttributes
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+@attr.s(slots=True, frozen=True)
+class EventListener:
+    """Event listener."""
+
+    event_type: BusEvent = attr.ib()
+    callback: Callable[[Any], Awaitable[None]] = attr.ib()
 
 
 class Bus(CoreSysAttributes):
@@ -34,10 +43,9 @@ class Bus(CoreSysAttributes):
         for listener in self._listeners.get(event, []):
             self.sys_create_task(listener.callback(reference))
 
-
-@attr.s(slots=True, frozen=True)
-class EventListener:
-    """Event listener."""
-
-    event_type: BusEvent = attr.ib()
-    callback: Callable[[Any], Awaitable[None]] = attr.ib()
+    def remove_listener(self, listener: EventListener) -> None:
+        """Unregister an listener."""
+        try:
+            self._listeners[listener.event_type].remove(listener)
+        except (ValueError, KeyError):
+            _LOGGER.warning("Listener %s not registered", listener)

@@ -5,30 +5,22 @@ from pathlib import Path
 import signal
 
 from colorlog import ColoredFormatter
-import sentry_sdk
-from sentry_sdk.integrations.aiohttp import AioHttpIntegration
-from sentry_sdk.integrations.atexit import AtexitIntegration
-from sentry_sdk.integrations.dedupe import DedupeIntegration
-from sentry_sdk.integrations.excepthook import ExcepthookIntegration
-from sentry_sdk.integrations.logging import LoggingIntegration
-from sentry_sdk.integrations.threading import ThreadingIntegration
 
-from supervisor.jobs import JobManager
-
-from .addons import AddonManager
+from .addons.manager import AddonManager
 from .api import RestAPI
 from .arch import CpuArch
 from .auth import Auth
 from .backups.manager import BackupManager
 from .bus import Bus
 from .const import (
+    ATTR_ADDONS_CUSTOM_LIST,
+    ATTR_REPOSITORIES,
     ENV_HOMEASSISTANT_REPOSITORY,
     ENV_SUPERVISOR_MACHINE,
     ENV_SUPERVISOR_NAME,
     ENV_SUPERVISOR_SHARE,
     MACHINE_ID,
     SOCKET_DOCKER,
-    SUPERVISOR_VERSION,
     LogLevel,
     UpdateChannel,
 )
@@ -36,21 +28,25 @@ from .core import Core
 from .coresys import CoreSys
 from .dbus.manager import DBusManager
 from .discovery import Discovery
+from .docker.manager import DockerAPI
 from .hardware.manager import HardwareManager
 from .homeassistant.module import HomeAssistant
 from .host.manager import HostManager
 from .ingress import Ingress
-from .misc.filter import filter_data
+from .jobs import JobManager
 from .misc.scheduler import Scheduler
 from .misc.tasks import Tasks
+from .mounts.manager import MountManager
 from .os.manager import OSManager
 from .plugins.manager import PluginManager
 from .resolution.module import ResolutionManager
-from .security import Security
+from .security.module import Security
 from .services import ServiceManager
 from .store import StoreManager
+from .store.validate import ensure_builtin_repositories
 from .supervisor import Supervisor
 from .updater import Updater
+from .utils.sentry import init_sentry
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -60,6 +56,7 @@ async def initialize_coresys() -> CoreSys:
     coresys = CoreSys()
 
     # Initialize core objects
+    coresys.docker = DockerAPI(coresys)
     coresys.resolution = ResolutionManager(coresys)
     coresys.jobs = JobManager(coresys)
     coresys.core = Core(coresys)
@@ -84,9 +81,11 @@ async def initialize_coresys() -> CoreSys:
     coresys.scheduler = Scheduler(coresys)
     coresys.security = Security(coresys)
     coresys.bus = Bus(coresys)
+    coresys.mounts = MountManager(coresys)
 
     # diagnostics
-    setup_diagnostics(coresys)
+    if coresys.config.diagnostics:
+        init_sentry(coresys)
 
     # bootstrap config
     initialize_system(coresys)
@@ -116,7 +115,7 @@ async def initialize_coresys() -> CoreSys:
         _LOGGER.warning(
             "Missing SUPERVISOR_MACHINE environment variable. Fallback to deprecated extraction!"
         )
-    _LOGGER.info("Seting up coresys for machine: %s", coresys.machine)
+    _LOGGER.info("Setting up coresys for machine: %s", coresys.machine)
 
     return coresys
 
@@ -203,6 +202,33 @@ def initialize_system(coresys: CoreSys) -> None:
         _LOGGER.debug("Creating Supervisor media folder at '%s'", config.path_media)
         config.path_media.mkdir()
 
+    # Mounts folders
+    if not config.path_mounts.is_dir():
+        _LOGGER.debug("Creating Supervisor mounts folder at '%s'", config.path_mounts)
+        config.path_mounts.mkdir()
+
+    if not config.path_mounts_credentials.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor mounts credentials folder at '%s'",
+            config.path_mounts_credentials,
+        )
+        config.path_mounts_credentials.mkdir(mode=0o600)
+
+    # Emergency folder
+    if not config.path_emergency.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor emergency folder at '%s'", config.path_emergency
+        )
+        config.path_emergency.mkdir()
+
+    # Addon Configs folder
+    if not config.path_addon_configs.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor add-on configs folder at '%s'",
+            config.path_addon_configs,
+        )
+        config.path_addon_configs.mkdir()
+
 
 def migrate_system_env(coresys: CoreSys) -> None:
     """Cleanup some stuff after update."""
@@ -216,13 +242,25 @@ def migrate_system_env(coresys: CoreSys) -> None:
         except OSError:
             _LOGGER.error("Can't cleanup old Add-on build directory at '%s'", old_build)
 
+    # Supervisor 2022.5 -> 2022.6. Can be removed after 2022.9
+    # pylint: disable=protected-access
+    if len(coresys.config.addons_repositories) > 0:
+        coresys.store._data[ATTR_REPOSITORIES] = ensure_builtin_repositories(
+            coresys.config.addons_repositories
+        )
+        coresys.config._data[ATTR_ADDONS_CUSTOM_LIST] = []
+        coresys.store.save_data()
+        coresys.config.save_data()
+
 
 def initialize_logging() -> None:
     """Initialize the logging."""
     logging.basicConfig(level=logging.INFO)
-    fmt = "%(asctime)s %(levelname)s (%(threadName)s) [%(name)s] %(message)s"
+    fmt = (
+        "%(asctime)s.%(msecs)03d %(levelname)s (%(threadName)s) [%(name)s] %(message)s"
+    )
     colorfmt = f"%(log_color)s{fmt}%(reset)s"
-    datefmt = "%y-%m-%d %H:%M:%S"
+    datefmt = "%Y-%m-%d %H:%M:%S"
 
     # suppress overly verbose logs from libraries that aren't helpful
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
@@ -302,25 +340,3 @@ def supervisor_debugger(coresys: CoreSys) -> None:
     if coresys.config.debug_block:
         _LOGGER.info("Wait until debugger is attached")
         debugpy.wait_for_client()
-
-
-def setup_diagnostics(coresys: CoreSys) -> None:
-    """Sentry diagnostic backend."""
-    _LOGGER.info("Initializing Supervisor Sentry")
-    # pylint: disable=abstract-class-instantiated
-    sentry_sdk.init(
-        dsn="https://9c6ea70f49234442b4746e447b24747e@o427061.ingest.sentry.io/5370612",
-        before_send=lambda event, hint: filter_data(coresys, event, hint),
-        auto_enabling_integrations=False,
-        default_integrations=False,
-        integrations=[
-            AioHttpIntegration(),
-            ExcepthookIntegration(),
-            DedupeIntegration(),
-            AtexitIntegration(),
-            ThreadingIntegration(),
-            LoggingIntegration(level=logging.WARNING, event_level=logging.CRITICAL),
-        ],
-        release=SUPERVISOR_VERSION,
-        max_breadcrumbs=30,
-    )

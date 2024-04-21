@@ -1,30 +1,30 @@
 """Validate some things around restore."""
+from __future__ import annotations
+
+from typing import Any
+
+from awesomeversion import AwesomeVersion
 import voluptuous as vol
 
 from ..backups.const import BackupType
 from ..const import (
     ATTR_ADDONS,
-    ATTR_AUDIO_INPUT,
-    ATTR_AUDIO_OUTPUT,
-    ATTR_BOOT,
+    ATTR_COMPRESSED,
     ATTR_CRYPTO,
     ATTR_DATE,
+    ATTR_DAYS_UNTIL_STALE,
     ATTR_DOCKER,
+    ATTR_EXCLUDE_DATABASE,
     ATTR_FOLDERS,
     ATTR_HOMEASSISTANT,
-    ATTR_IMAGE,
     ATTR_NAME,
-    ATTR_PORT,
     ATTR_PROTECTED,
-    ATTR_REFRESH_TOKEN,
     ATTR_REPOSITORIES,
     ATTR_SIZE,
     ATTR_SLUG,
-    ATTR_SSL,
+    ATTR_SUPERVISOR_VERSION,
     ATTR_TYPE,
     ATTR_VERSION,
-    ATTR_WAIT_BOOT,
-    ATTR_WATCHDOG,
     CRYPTO_AES128,
     FOLDER_ADDONS,
     FOLDER_HOMEASSISTANT,
@@ -32,16 +32,10 @@ from ..const import (
     FOLDER_SHARE,
     FOLDER_SSL,
 )
-from ..validate import (
-    SCHEMA_DOCKER_CONFIG,
-    docker_image,
-    network_port,
-    repositories,
-    version_tag,
-)
+from ..store.validate import repositories
+from ..validate import SCHEMA_DOCKER_CONFIG, version_tag
 
 ALL_FOLDERS = [
-    FOLDER_HOMEASSISTANT,
     FOLDER_SHARE,
     FOLDER_ADDONS,
     FOLDER_SSL,
@@ -58,37 +52,69 @@ def unique_addons(addons_list):
     return addons_list
 
 
+def v1_homeassistant(
+    homeassistant_data: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Cleanup homeassistant artefacts from v1."""
+    if not homeassistant_data:
+        return None
+
+    if homeassistant_data.get(ATTR_VERSION) is None:
+        return None
+
+    return homeassistant_data
+
+
+def v1_folderlist(folder_data: list[str]) -> list[str]:
+    """Cleanup folder artefacts from v1."""
+    if FOLDER_HOMEASSISTANT in folder_data:
+        folder_data.remove(FOLDER_HOMEASSISTANT)
+    return folder_data
+
+
+def v1_protected(protected: bool | str) -> bool:
+    """Cleanup old protected handling."""
+    if isinstance(protected, bool):
+        return protected
+    return True
+
+
 # pylint: disable=no-value-for-parameter
+days_until_stale = vol.All(vol.Coerce(int), vol.Range(min=1))
+
 SCHEMA_BACKUP = vol.Schema(
     {
+        vol.Optional(ATTR_VERSION, default=1): vol.All(vol.Coerce(int), vol.In((1, 2))),
+        vol.Optional(
+            ATTR_SUPERVISOR_VERSION, default=AwesomeVersion("2022.08.3")
+        ): version_tag,
         vol.Required(ATTR_SLUG): str,
         vol.Required(ATTR_TYPE): vol.Coerce(BackupType),
         vol.Required(ATTR_NAME): str,
         vol.Required(ATTR_DATE): str,
-        vol.Inclusive(ATTR_PROTECTED, "encrypted"): vol.All(
-            str, vol.Length(min=1, max=1)
+        vol.Optional(ATTR_COMPRESSED, default=True): vol.Boolean(),
+        vol.Optional(ATTR_PROTECTED, default=False): vol.All(
+            v1_protected, vol.Boolean()
         ),
-        vol.Inclusive(ATTR_CRYPTO, "encrypted"): CRYPTO_AES128,
-        vol.Optional(ATTR_HOMEASSISTANT, default=dict): vol.Schema(
-            {
-                vol.Optional(ATTR_VERSION): version_tag,
-                vol.Optional(ATTR_IMAGE): docker_image,
-                vol.Optional(ATTR_BOOT, default=True): vol.Boolean(),
-                vol.Optional(ATTR_SSL, default=False): vol.Boolean(),
-                vol.Optional(ATTR_PORT, default=8123): network_port,
-                vol.Optional(ATTR_REFRESH_TOKEN): vol.Maybe(str),
-                vol.Optional(ATTR_WATCHDOG, default=True): vol.Boolean(),
-                vol.Optional(ATTR_WAIT_BOOT, default=600): vol.All(
-                    vol.Coerce(int), vol.Range(min=60)
-                ),
-                vol.Optional(ATTR_AUDIO_OUTPUT, default=None): vol.Maybe(str),
-                vol.Optional(ATTR_AUDIO_INPUT, default=None): vol.Maybe(str),
-            },
-            extra=vol.REMOVE_EXTRA,
+        vol.Optional(ATTR_CRYPTO, default=None): vol.Maybe(CRYPTO_AES128),
+        vol.Optional(ATTR_HOMEASSISTANT, default=None): vol.All(
+            v1_homeassistant,
+            vol.Maybe(
+                vol.Schema(
+                    {
+                        vol.Required(ATTR_VERSION): version_tag,
+                        vol.Optional(ATTR_SIZE, default=0): vol.Coerce(float),
+                        vol.Optional(
+                            ATTR_EXCLUDE_DATABASE, default=False
+                        ): vol.Boolean(),
+                    },
+                    extra=vol.REMOVE_EXTRA,
+                )
+            ),
         ),
         vol.Optional(ATTR_DOCKER, default=dict): SCHEMA_DOCKER_CONFIG,
         vol.Optional(ATTR_FOLDERS, default=list): vol.All(
-            [vol.In(ALL_FOLDERS)], vol.Unique()
+            v1_folderlist, [vol.In(ALL_FOLDERS)], vol.Unique()
         ),
         vol.Optional(ATTR_ADDONS, default=list): vol.All(
             [
@@ -107,4 +133,11 @@ SCHEMA_BACKUP = vol.Schema(
         vol.Optional(ATTR_REPOSITORIES, default=list): repositories,
     },
     extra=vol.ALLOW_EXTRA,
+)
+
+SCHEMA_BACKUPS_CONFIG = vol.Schema(
+    {
+        vol.Optional(ATTR_DAYS_UNTIL_STALE, default=30): days_until_stale,
+    },
+    extra=vol.REMOVE_EXTRA,
 )

@@ -6,17 +6,28 @@ import logging
 import aiohttp
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectorError
+from aiohttp.client_ws import ClientWebSocketResponse
 from aiohttp.hdrs import AUTHORIZATION, CONTENT_TYPE
+from aiohttp.http import WSMessage
+from aiohttp.http_websocket import WSMsgType
 from aiohttp.web_exceptions import HTTPBadGateway, HTTPUnauthorized
 
 from ..coresys import CoreSysAttributes
 from ..exceptions import APIError, HomeAssistantAPIError, HomeAssistantAuthError
+from ..utils.json import json_dumps
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 FORWARD_HEADERS = ("X-Speech-Content",)
 HEADER_HA_ACCESS = "X-Ha-Access"
+
+# Maximum message size for websocket messages from Home Assistant.
+# Since these are coming from core we want the largest possible size
+# that is not likely to cause a memory problem as most modern browsers
+# support large messages.
+# https://github.com/home-assistant/supervisor/issues/4392
+MAX_MESSAGE_SIZE_FROM_CORE = 64 * 1024 * 1024
 
 
 class APIProxy(CoreSysAttributes):
@@ -67,7 +78,7 @@ class APIProxy(CoreSysAttributes):
             _LOGGER.error("Error on API for request %s", path)
         except aiohttp.ClientError as err:
             _LOGGER.error("Client error on API %s request %s", path, err)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _LOGGER.error("Client timeout error on API request %s", path)
 
         raise HTTPBadGateway()
@@ -107,12 +118,14 @@ class APIProxy(CoreSysAttributes):
                 body=data, status=client.status, content_type=client.content_type
             )
 
-    async def _websocket_client(self):
+    async def _websocket_client(self) -> ClientWebSocketResponse:
         """Initialize a WebSocket API connection."""
         url = f"{self.sys_homeassistant.api_url}/api/websocket"
 
         try:
-            client = await self.sys_websession.ws_connect(url, heartbeat=30, ssl=False)
+            client = await self.sys_websession.ws_connect(
+                url, heartbeat=30, ssl=False, max_msg_size=MAX_MESSAGE_SIZE_FROM_CORE
+            )
 
             # Handle authentication
             data = await client.receive_json()
@@ -133,7 +146,8 @@ class APIProxy(CoreSysAttributes):
                 {
                     "type": "auth",
                     "access_token": self.sys_homeassistant.api.access_token,
-                }
+                },
+                dumps=json_dumps,
             )
 
             data = await client.receive_json()
@@ -158,6 +172,28 @@ class APIProxy(CoreSysAttributes):
 
         raise APIError()
 
+    async def _proxy_message(
+        self,
+        read_task: asyncio.Task,
+        target: web.WebSocketResponse | ClientWebSocketResponse,
+    ) -> None:
+        """Proxy a message from client to server or vice versa."""
+        if read_task.exception():
+            raise read_task.exception()
+
+        msg: WSMessage = read_task.result()
+        if msg.type == WSMsgType.TEXT:
+            return await target.send_str(msg.data)
+        if msg.type == WSMsgType.BINARY:
+            return await target.send_bytes(msg.data)
+        if msg.type == WSMsgType.CLOSE:
+            _LOGGER.debug("Received close message from WebSocket.")
+            return await target.close()
+
+        raise TypeError(
+            f"Cannot proxy websocket message of unsupported type: {msg.type}"
+        )
+
     async def websocket(self, request: web.Request):
         """Initialize a WebSocket API connection."""
         if not await self.sys_homeassistant.api.check_api_state():
@@ -167,11 +203,13 @@ class APIProxy(CoreSysAttributes):
         # init server
         server = web.WebSocketResponse(heartbeat=30)
         await server.prepare(request)
+        addon_name = None
 
         # handle authentication
         try:
             await server.send_json(
-                {"type": "auth_required", "ha_version": self.sys_homeassistant.version}
+                {"type": "auth_required", "ha_version": self.sys_homeassistant.version},
+                dumps=json_dumps,
             )
 
             # Check API access
@@ -184,14 +222,17 @@ class APIProxy(CoreSysAttributes):
             if not addon or not addon.access_homeassistant_api:
                 _LOGGER.warning("Unauthorized WebSocket access!")
                 await server.send_json(
-                    {"type": "auth_invalid", "message": "Invalid access"}
+                    {"type": "auth_invalid", "message": "Invalid access"},
+                    dumps=json_dumps,
                 )
                 return server
 
-            _LOGGER.info("WebSocket access from %s", addon.slug)
+            addon_name = addon.slug
+            _LOGGER.info("WebSocket access from %s", addon_name)
 
             await server.send_json(
-                {"type": "auth_ok", "ha_version": self.sys_homeassistant.version}
+                {"type": "auth_ok", "ha_version": self.sys_homeassistant.version},
+                dumps=json_dumps,
             )
         except (RuntimeError, ValueError) as err:
             _LOGGER.error("Can't initialize handshake: %s", err)
@@ -205,13 +246,13 @@ class APIProxy(CoreSysAttributes):
 
         _LOGGER.info("Home Assistant WebSocket API request running")
         try:
-            client_read = None
-            server_read = None
+            client_read: asyncio.Task | None = None
+            server_read: asyncio.Task | None = None
             while not server.closed and not client.closed:
                 if not client_read:
-                    client_read = self.sys_create_task(client.receive_str())
+                    client_read = self.sys_create_task(client.receive())
                 if not server_read:
-                    server_read = self.sys_create_task(server.receive_str())
+                    server_read = self.sys_create_task(server.receive())
 
                 # wait until data need to be processed
                 await asyncio.wait(
@@ -220,14 +261,12 @@ class APIProxy(CoreSysAttributes):
 
                 # server
                 if server_read.done() and not client.closed:
-                    server_read.exception()
-                    await client.send_str(server_read.result())
+                    await self._proxy_message(server_read, client)
                     server_read = None
 
                 # client
                 if client_read.done() and not server.closed:
-                    client_read.exception()
-                    await server.send_str(client_read.result())
+                    await self._proxy_message(client_read, server)
                     client_read = None
 
         except asyncio.CancelledError:
@@ -237,9 +276,9 @@ class APIProxy(CoreSysAttributes):
             _LOGGER.info("Home Assistant WebSocket API error: %s", err)
 
         finally:
-            if client_read:
+            if client_read and not client_read.done():
                 client_read.cancel()
-            if server_read:
+            if server_read and not server_read.done():
                 server_read.cancel()
 
             # close connections
@@ -248,5 +287,5 @@ class APIProxy(CoreSysAttributes):
             if not server.closed:
                 await server.close()
 
-        _LOGGER.info("Home Assistant WebSocket API connection is closed")
+        _LOGGER.info("Home Assistant WebSocket API for %s closed", addon_name)
         return server

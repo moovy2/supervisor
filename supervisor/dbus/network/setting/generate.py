@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import socket
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from dbus_next.signature import Variant
+from dbus_fast import Variant
 
+from ....host.const import InterfaceMethod, InterfaceType
+from .. import NetworkManager
 from . import (
     ATTR_ASSIGNED_MAC,
     CONF_ATTR_802_ETHERNET,
@@ -15,49 +17,56 @@ from . import (
     CONF_ATTR_CONNECTION,
     CONF_ATTR_IPV4,
     CONF_ATTR_IPV6,
+    CONF_ATTR_MATCH,
+    CONF_ATTR_PATH,
     CONF_ATTR_VLAN,
 )
-from ....host.const import InterfaceMethod, InterfaceType
 
 if TYPE_CHECKING:
-    from ....host.network import Interface
+    from ....host.configuration import Interface
 
 
 def get_connection_from_interface(
-    interface: Interface, name: str | None = None, uuid: str | None = None
-) -> Any:
+    interface: Interface,
+    network_manager: NetworkManager,
+    name: str | None = None,
+    uuid: str | None = None,
+) -> dict[str, dict[str, Variant]]:
     """Generate message argument for network interface update."""
 
     # Generate/Update ID/name
     if not name or not name.startswith("Supervisor"):
         name = f"Supervisor {interface.name}"
-    if interface.type == InterfaceType.VLAN:
-        name = f"{name}.{interface.vlan.id}"
+        if interface.type == InterfaceType.VLAN:
+            name = f"{name}.{interface.vlan.id}"
 
     if interface.type == InterfaceType.ETHERNET:
         iftype = "802-3-ethernet"
     elif interface.type == InterfaceType.WIRELESS:
         iftype = "802-11-wireless"
     else:
-        iftype = interface.type.value
+        iftype = interface.type
 
     # Generate UUID
     if not uuid:
         uuid = str(uuid4())
 
-    connection = {
-        "id": Variant("s", name),
-        "type": Variant("s", iftype),
-        "uuid": Variant("s", uuid),
-        "llmnr": Variant("i", 2),
-        "mdns": Variant("i", 2),
+    conn: dict[str, dict[str, Variant]] = {
+        CONF_ATTR_CONNECTION: {
+            "id": Variant("s", name),
+            "type": Variant("s", iftype),
+            "uuid": Variant("s", uuid),
+            "llmnr": Variant("i", 2),
+            "mdns": Variant("i", 2),
+            "autoconnect": Variant("b", True),
+        },
     }
 
     if interface.type != InterfaceType.VLAN:
-        connection["interface-name"] = Variant("s", interface.name)
-
-    conn = {}
-    conn[CONF_ATTR_CONNECTION] = connection
+        if interface.path:
+            conn[CONF_ATTR_MATCH] = {CONF_ATTR_PATH: Variant("as", [interface.path])}
+        else:
+            conn[CONF_ATTR_CONNECTION]["interface-name"] = Variant("s", interface.name)
 
     ipv4 = {}
     if not interface.ipv4 or interface.ipv4.method == InterfaceMethod.AUTO:
@@ -92,7 +101,7 @@ def get_connection_from_interface(
     if not interface.ipv6 or interface.ipv6.method == InterfaceMethod.AUTO:
         ipv6["method"] = Variant("s", "auto")
     elif interface.ipv6.method == InterfaceMethod.DISABLED:
-        ipv6["method"] = Variant("s", "disabled")
+        ipv6["method"] = Variant("s", "link-local")
     else:
         ipv6["method"] = Variant("s", "manual")
         ipv6["dns"] = Variant(
@@ -116,9 +125,15 @@ def get_connection_from_interface(
     if interface.type == InterfaceType.ETHERNET:
         conn[CONF_ATTR_802_ETHERNET] = {ATTR_ASSIGNED_MAC: Variant("s", "preserve")}
     elif interface.type == "vlan":
+        parent = interface.vlan.interface
+        if parent in network_manager and (
+            parent_connection := network_manager.get(parent).connection
+        ):
+            parent = parent_connection.uuid
+
         conn[CONF_ATTR_VLAN] = {
             "id": Variant("u", interface.vlan.id),
-            "parent": Variant("s", interface.vlan.interface),
+            "parent": Variant("s", parent),
         }
     elif interface.type == InterfaceType.WIRELESS:
         wireless = {
@@ -133,8 +148,8 @@ def get_connection_from_interface(
             wireless["security"] = Variant("s", CONF_ATTR_802_WIRELESS_SECURITY)
             wireless_security = {}
             if interface.wifi.auth == "wep":
-                wireless_security["auth-alg"] = Variant("s", "none")
-                wireless_security["key-mgmt"] = Variant("s", "open")
+                wireless_security["auth-alg"] = Variant("s", "open")
+                wireless_security["key-mgmt"] = Variant("s", "none")
             elif interface.wifi.auth == "wpa-psk":
                 wireless_security["auth-alg"] = Variant("s", "open")
                 wireless_security["key-mgmt"] = Variant("s", "wpa-psk")

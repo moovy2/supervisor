@@ -1,10 +1,9 @@
 """Pulse host control."""
+from dataclasses import dataclass, field
 from datetime import timedelta
-from enum import Enum
+from enum import StrEnum
 import logging
-from typing import Optional
 
-import attr
 from pulsectl import Pulse, PulseError, PulseIndexError, PulseOperationFailed
 
 from ..coresys import CoreSys, CoreSysAttributes
@@ -16,58 +15,71 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 PULSE_NAME = "supervisor"
 
+PULSE_ALSA_MODULE = "module-alsa-card"
+PULSE_UDEV_MODULE = "module-udev-detect"
 
-class StreamType(str, Enum):
+
+class StreamType(StrEnum):
     """INPUT/OUTPUT type of source."""
 
     INPUT = "input"
     OUTPUT = "output"
 
 
-@attr.s(frozen=True)
+@dataclass(slots=True, frozen=True)
 class AudioApplication:
     """Represent a application on the stream."""
 
-    name: str = attr.ib()
-    index: int = attr.ib()
-    stream_index: str = attr.ib()
-    stream_type: StreamType = attr.ib()
-    volume: float = attr.ib()
-    mute: bool = attr.ib()
-    addon: str = attr.ib()
+    name: str
+    index: int
+    stream_index: str
+    stream_type: StreamType
+    volume: float
+    mute: bool
+    addon: str
 
 
-@attr.s(frozen=True)
+@dataclass(slots=True, frozen=True)
 class AudioStream:
     """Represent a input/output stream."""
 
-    name: str = attr.ib()
-    index: int = attr.ib()
-    description: str = attr.ib()
-    volume: float = attr.ib()
-    mute: bool = attr.ib()
-    default: bool = attr.ib()
-    card: Optional[int] = attr.ib()
-    applications: list[AudioApplication] = attr.ib()
+    name: str
+    index: int
+    description: str
+    volume: float
+    mute: bool
+    default: bool
+    card: int | None
+    applications: list[AudioApplication]
 
 
-@attr.s(frozen=True)
+@dataclass(slots=True, frozen=True)
 class SoundProfile:
     """Represent a Sound Card profile."""
 
-    name: str = attr.ib()
-    description: str = attr.ib()
-    active: bool = attr.ib()
+    name: str
+    description: str
+    active: bool
 
 
-@attr.s(frozen=True)
+@dataclass(slots=True, frozen=True)
 class SoundCard:
     """Represent a Sound Card."""
 
-    name: str = attr.ib()
-    index: int = attr.ib()
-    driver: str = attr.ib()
-    profiles: list[SoundProfile] = attr.ib()
+    name: str
+    index: int
+    driver: str
+    profiles: list[SoundProfile]
+
+
+@dataclass(slots=True)
+class PulseData:
+    """Represent pulse data we care about."""
+
+    cards: list[SoundCard] = field(default_factory=list)
+    inputs: list[AudioStream] = field(default_factory=list)
+    outputs: list[AudioStream] = field(default_factory=list)
+    applications: list[AudioApplication] = field(default_factory=list)
 
 
 class SoundControl(CoreSysAttributes):
@@ -143,11 +155,10 @@ class SoundControl(CoreSysAttributes):
                             stream = pulse.source_output_info(index)
                         else:
                             stream = pulse.source_info(index)
+                    elif application:
+                        stream = pulse.sink_input_info(index)
                     else:
-                        if application:
-                            stream = pulse.sink_input_info(index)
-                        else:
-                            stream = pulse.sink_info(index)
+                        stream = pulse.sink_info(index)
 
                     # Set volume
                     pulse.volume_set_all_chans(stream, volume)
@@ -178,11 +189,10 @@ class SoundControl(CoreSysAttributes):
                             stream = pulse.source_output_info(index)
                         else:
                             stream = pulse.source_info(index)
+                    elif application:
+                        stream = pulse.sink_input_info(index)
                     else:
-                        if application:
-                            stream = pulse.sink_input_info(index)
-                        else:
-                            stream = pulse.sink_info(index)
+                        stream = pulse.sink_info(index)
 
                     # Mute stream
                     pulse.mute(stream, mute)
@@ -223,125 +233,150 @@ class SoundControl(CoreSysAttributes):
         await self.sys_run_in_executor(_activate_profile)
         await self.update()
 
-    @Job(limit=JobExecutionLimit.THROTTLE_WAIT, throttle_period=timedelta(seconds=10))
-    async def update(self):
+    @Job(
+        name="sound_control_update",
+        limit=JobExecutionLimit.THROTTLE_WAIT,
+        throttle_period=timedelta(seconds=2),
+    )
+    async def update(self, reload_pulse: bool = False):
         """Update properties over dbus."""
         _LOGGER.info("Updating PulseAudio information")
 
-        def _update():
+        def _get_pulse_data() -> PulseData:
+            data = PulseData()
+
             try:
                 with Pulse(PULSE_NAME) as pulse:
                     server = pulse.server_info()
 
                     # Update applications
-                    self._applications.clear()
-                    for application in pulse.sink_input_list():
-                        self._applications.append(
-                            AudioApplication(
-                                application.proplist.get(
-                                    "application.name", application.name
-                                ),
-                                application.index,
-                                application.sink,
-                                StreamType.OUTPUT,
-                                application.volume.value_flat,
-                                bool(application.mute),
-                                application.proplist.get(
-                                    "application.process.machine_id", ""
-                                ).replace("-", "_"),
-                            )
+                    data.applications = [
+                        AudioApplication(
+                            application.proplist.get(
+                                "application.name", application.name
+                            ),
+                            application.index,
+                            application.sink,
+                            StreamType.OUTPUT,
+                            application.volume.value_flat,
+                            bool(application.mute),
+                            application.proplist.get(
+                                "application.process.machine_id", ""
+                            ).replace("-", "_"),
                         )
-                    for application in pulse.source_output_list():
-                        self._applications.append(
-                            AudioApplication(
-                                application.proplist.get(
-                                    "application.name", application.name
-                                ),
-                                application.index,
-                                application.source,
-                                StreamType.INPUT,
-                                application.volume.value_flat,
-                                bool(application.mute),
-                                application.proplist.get(
-                                    "application.process.machine_id", ""
-                                ).replace("-", "_"),
-                            )
+                        for application in pulse.sink_input_list()
+                    ]
+                    data.applications.extend(
+                        AudioApplication(
+                            application.proplist.get(
+                                "application.name", application.name
+                            ),
+                            application.index,
+                            application.source,
+                            StreamType.INPUT,
+                            application.volume.value_flat,
+                            bool(application.mute),
+                            application.proplist.get(
+                                "application.process.machine_id", ""
+                            ).replace("-", "_"),
                         )
+                        for application in pulse.source_output_list()
+                    )
 
                     # Update output
-                    self._outputs.clear()
-                    for sink in pulse.sink_list():
-                        self._outputs.append(
-                            AudioStream(
-                                sink.name,
-                                sink.index,
-                                sink.description,
-                                sink.volume.value_flat,
-                                bool(sink.mute),
-                                sink.name == server.default_sink_name,
-                                sink.card if sink.card != 0xFFFFFFFF else None,
-                                [
-                                    application
-                                    for application in self._applications
-                                    if application.stream_index == sink.index
-                                    and application.stream_type == StreamType.OUTPUT
-                                ],
-                            )
+                    data.outputs = [
+                        AudioStream(
+                            sink.name,
+                            sink.index,
+                            sink.description,
+                            sink.volume.value_flat,
+                            bool(sink.mute),
+                            sink.name == server.default_sink_name,
+                            sink.card if sink.card != 0xFFFFFFFF else None,
+                            [
+                                application
+                                for application in data.applications
+                                if application.stream_index == sink.index
+                                and application.stream_type == StreamType.OUTPUT
+                            ],
                         )
+                        for sink in pulse.sink_list()
+                    ]
 
                     # Update input
-                    self._inputs.clear()
-                    for source in pulse.source_list():
-                        # Filter monitor devices out because we did not use it now
-                        if source.name.endswith(".monitor"):
-                            continue
-                        self._inputs.append(
-                            AudioStream(
-                                source.name,
-                                source.index,
-                                source.description,
-                                source.volume.value_flat,
-                                bool(source.mute),
-                                source.name == server.default_source_name,
-                                source.card if source.card != 0xFFFFFFFF else None,
-                                [
-                                    application
-                                    for application in self._applications
-                                    if application.stream_index == source.index
-                                    and application.stream_type == StreamType.INPUT
-                                ],
-                            )
+                    data.inputs = [
+                        AudioStream(
+                            source.name,
+                            source.index,
+                            source.description,
+                            source.volume.value_flat,
+                            bool(source.mute),
+                            source.name == server.default_source_name,
+                            source.card if source.card != 0xFFFFFFFF else None,
+                            [
+                                application
+                                for application in data.applications
+                                if application.stream_index == source.index
+                                and application.stream_type == StreamType.INPUT
+                            ],
                         )
+                        for source in pulse.source_list()
+                        # Filter monitor devices out because we did not use it now
+                        if not source.name.endswith(".monitor")
+                    ]
 
                     # Update Sound Card
-                    self._cards.clear()
-                    for card in pulse.card_list():
-                        sound_profiles: list[SoundProfile] = []
-
-                        # Generate profiles
-                        for profile in card.profile_list:
-                            if not profile.available:
-                                continue
-                            sound_profiles.append(
+                    data.cards = [
+                        SoundCard(
+                            card.name,
+                            card.index,
+                            card.driver,
+                            [
                                 SoundProfile(
                                     profile.name,
                                     profile.description,
                                     profile.name == card.profile_active.name,
                                 )
-                            )
-
-                        self._cards.append(
-                            SoundCard(
-                                card.name, card.index, card.driver, sound_profiles
-                            )
+                                for profile in card.profile_list
+                                if profile.available
+                            ],
                         )
+                        for card in pulse.card_list()
+                    ]
 
             except PulseOperationFailed as err:
                 raise PulseAudioError(
                     f"Error while processing pulse update: {err}", _LOGGER.error
                 ) from err
             except PulseError as err:
-                _LOGGER.debug("Can't update PulseAudio data: %s", err)
+                _LOGGER.warning("Can't update PulseAudio data: %s", err)
 
-        # Run update from pulse server
-        await self.sys_run_in_executor(_update)
+            return data
+
+        def _reload_pulse_modules():
+            try:
+                with Pulse(PULSE_NAME) as pulse:
+                    modules = pulse.module_list()
+                    for alsa_module in filter(
+                        lambda x: x.name == PULSE_ALSA_MODULE, modules
+                    ):
+                        pulse.module_unload(alsa_module.index)
+                    udev_module = next(
+                        filter(lambda x: x.name == PULSE_UDEV_MODULE, modules)
+                    )
+                    pulse.module_unload(udev_module.index)
+                    # And now reload
+                    pulse.module_load(PULSE_UDEV_MODULE)
+            except StopIteration:
+                _LOGGER.warning("Can't reload PulseAudio modules.")
+            except PulseError as err:
+                _LOGGER.warning("Can't reload PulseAudio modules: %s", err)
+
+        # Update data from pulse server
+        if reload_pulse:
+            await self.sys_run_in_executor(_reload_pulse_modules)
+        data: PulseData = await self.sys_run_in_executor(_get_pulse_data)
+        self._applications = data.applications
+        self._cards = data.cards
+        self._inputs = data.inputs
+        self._outputs = data.outputs

@@ -1,14 +1,12 @@
 """Hardware Manager of Supervisor."""
 import logging
 from pathlib import Path
-from typing import Optional
 
 import pyudev
 
-from supervisor.hardware.const import UdevSubsystem
-
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HardwareNotFound
+from .const import UdevSubsystem
 from .data import Device
 from .disk import HwDisk
 from .helper import HwHelper
@@ -66,7 +64,7 @@ class HardwareManager(CoreSysAttributes):
                 return device
         raise HardwareNotFound()
 
-    def filter_devices(self, subsystem: Optional[UdevSubsystem] = None) -> list[Device]:
+    def filter_devices(self, subsystem: UdevSubsystem | None = None) -> list[Device]:
         """Return a filtered list."""
         devices = set()
         for device in self.devices:
@@ -96,7 +94,7 @@ class HardwareManager(CoreSysAttributes):
         udev_device: pyudev.Device = pyudev.Devices.from_sys_path(
             self._udev, str(device.sysfs)
         )
-        return udev_device.find_parent(subsystem.value) is not None
+        return udev_device.find_parent(subsystem) is not None
 
     def _import_devices(self) -> None:
         """Import fresh from udev database."""

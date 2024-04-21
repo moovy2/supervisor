@@ -1,7 +1,6 @@
 """Helpers to check core security."""
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
-from typing import Optional
 
 from awesomeversion import AwesomeVersion, AwesomeVersionException
 
@@ -16,7 +15,7 @@ def setup(coresys: CoreSys) -> CheckBase:
     return CheckCoreSecurity(coresys)
 
 
-class SecurityReference(str, Enum):
+class SecurityReference(StrEnum):
     """Version references."""
 
     CUSTOM_COMPONENTS_BELOW_2021_1_5 = "custom_components_below_2021_1_5"
@@ -42,7 +41,7 @@ class CheckCoreSecurity(CheckBase):
         except (AwesomeVersionException, OSError):
             return
 
-    async def approve_check(self, reference: Optional[str] = None) -> bool:
+    async def approve_check(self, reference: str | None = None) -> bool:
         """Approve check if it is affected by issue."""
         try:
             if self.sys_homeassistant.version >= AwesomeVersion("2021.1.5"):
