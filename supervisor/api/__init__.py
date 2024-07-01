@@ -9,7 +9,7 @@ from aiohttp_fast_url_dispatcher import FastUrlDispatcher, attach_fast_url_dispa
 
 from ..const import AddonState
 from ..coresys import CoreSys, CoreSysAttributes
-from ..exceptions import APIAddonNotInstalled
+from ..exceptions import APIAddonNotInstalled, HostNotSupportedError
 from ..utils.sentry import capture_exception
 from .addons import APIAddons
 from .audio import APIAudio
@@ -401,7 +401,7 @@ class RestAPI(CoreSysAttributes):
 
         async def get_supervisor_logs(*args, **kwargs):
             try:
-                return await self._api_host.advanced_logs(
+                return await self._api_host.advanced_logs_handler(
                     *args, identifier="hassio_supervisor", **kwargs
                 )
             except Exception as err:  # pylint: disable=broad-exception-caught
@@ -410,7 +410,10 @@ class RestAPI(CoreSysAttributes):
                 _LOGGER.exception(
                     "Failed to get supervisor logs using advanced_logs API"
                 )
-                capture_exception(err)
+                if not isinstance(err, HostNotSupportedError):
+                    # No need to capture HostNotSupportedError to Sentry, the cause
+                    # is known and reported to the user using the resolution center.
+                    capture_exception(err)
                 return await api_supervisor.logs(*args, **kwargs)
 
         self.webapp.add_routes(
@@ -694,7 +697,6 @@ class RestAPI(CoreSysAttributes):
                 web.get("/store", api_store.store_info),
                 web.get("/store/addons", api_store.addons_list),
                 web.get("/store/addons/{addon}", api_store.addons_addon_info),
-                web.get("/store/addons/{addon}/{version}", api_store.addons_addon_info),
                 web.get("/store/addons/{addon}/icon", api_store.addons_addon_icon),
                 web.get("/store/addons/{addon}/logo", api_store.addons_addon_logo),
                 web.get(
@@ -716,6 +718,8 @@ class RestAPI(CoreSysAttributes):
                     "/store/addons/{addon}/update/{version}",
                     api_store.addons_addon_update,
                 ),
+                # Must be below others since it has a wildcard in resource path
+                web.get("/store/addons/{addon}/{version}", api_store.addons_addon_info),
                 web.post("/store/reload", api_store.reload),
                 web.get("/store/repositories", api_store.repositories_list),
                 web.get(
